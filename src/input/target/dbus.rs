@@ -1,21 +1,30 @@
-use std::{collections::HashMap, error::Error};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+};
 
-use zbus::Connection;
+use zbus::object_server::Interface;
 
 use crate::{
-    dbus::interface::target::{dbus::TargetDBusInterface, TargetInterface},
+    dbus::interface::{
+        force_feedback::ForceFeedbackInterface, target::dbus::TargetDBusInterface,
+        DBusInterfaceManager,
+    },
     input::{
-        capability::{Capability, Gamepad, GamepadButton},
+        capability::{Capability, Gamepad, GamepadAxis, GamepadButton, GamepadTrigger},
+        composite_device::client::CompositeDeviceClient,
         event::{
             dbus::{Action, DBusEvent},
             native::NativeEvent,
             value::InputValue,
         },
+        output_capability::OutputCapability,
     },
 };
 
 use super::{
-    client::TargetDeviceClient, TargetDeviceTypeId, TargetInputDevice, TargetOutputDevice,
+    client::TargetDeviceClient, InputError, OutputError, TargetDeviceTypeId, TargetInputDevice,
+    TargetOutputDevice,
 };
 
 /// The threshold for axis inputs to be considered "pressed"
@@ -43,17 +52,23 @@ struct State {
 #[derive(Debug)]
 pub struct DBusDevice {
     state: State,
-    conn: Connection,
-    dbus_path: Option<String>,
+    dbus: Option<DBusInterfaceManager>,
+    device: Option<CompositeDeviceClient>,
+}
+
+impl Default for DBusDevice {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DBusDevice {
     // Create a new [DBusDevice] instance.
-    pub fn new(conn: Connection) -> Self {
+    pub fn new() -> Self {
         Self {
             state: State::default(),
-            conn,
-            dbus_path: None,
+            dbus: None,
+            device: None,
         }
     }
 
@@ -72,6 +87,13 @@ impl DBusDevice {
             let include_event = if matches!(&source_cap, Capability::Gamepad(Gamepad::Axis(_))) {
                 match event.action {
                     Action::Left => {
+                        // If the opposite axis is pressed, emit a "release" event
+                        // for it.
+                        if self.state.pressed_right {
+                            let other_event = DBusEvent::new(Action::Right, InputValue::Float(0.0));
+                            translated.push(other_event);
+                            self.state.pressed_right = false;
+                        }
                         if self.state.pressed_left && event.as_f64() < AXIS_THRESHOLD {
                             event.value = InputValue::Float(0.0);
                             self.state.pressed_left = false;
@@ -85,6 +107,13 @@ impl DBusDevice {
                         }
                     }
                     Action::Right => {
+                        // If the opposite axis is pressed, emit a "release" event
+                        // for it.
+                        if self.state.pressed_left {
+                            let other_event = DBusEvent::new(Action::Left, InputValue::Float(0.0));
+                            translated.push(other_event);
+                            self.state.pressed_left = false;
+                        }
                         if self.state.pressed_right && event.as_f64() < AXIS_THRESHOLD {
                             event.value = InputValue::Float(0.0);
                             self.state.pressed_right = false;
@@ -98,6 +127,13 @@ impl DBusDevice {
                         }
                     }
                     Action::Up => {
+                        // If the opposite axis is pressed, emit a "release" event
+                        // for it.
+                        if self.state.pressed_down {
+                            let other_event = DBusEvent::new(Action::Down, InputValue::Float(0.0));
+                            translated.push(other_event);
+                            self.state.pressed_down = false;
+                        }
                         if self.state.pressed_up && event.as_f64() < AXIS_THRESHOLD {
                             event.value = InputValue::Float(0.0);
                             self.state.pressed_up = false;
@@ -111,6 +147,13 @@ impl DBusDevice {
                         }
                     }
                     Action::Down => {
+                        // If the opposite axis is pressed, emit a "release" event
+                        // for it.
+                        if self.state.pressed_up {
+                            let other_event = DBusEvent::new(Action::Up, InputValue::Float(0.0));
+                            translated.push(other_event);
+                            self.state.pressed_up = false;
+                        }
                         if self.state.pressed_down && event.as_f64() < AXIS_THRESHOLD {
                             event.value = InputValue::Float(0.0);
                             self.state.pressed_down = false;
@@ -199,12 +242,13 @@ impl DBusDevice {
         }
 
         // DBus events can only be written if there is a DBus path reference.
-        let Some(path) = self.dbus_path.clone() else {
-            return Err("No dbus path exists to send events to".into());
+        let Some(dbus) = self.dbus.as_ref() else {
+            return Err("No dbus interface manager exists to send events to".into());
         };
 
         // Send the input event signal based on the type of value
-        let conn = self.conn.clone();
+        let path = dbus.path().to_string();
+        let conn = dbus.connection().clone();
         tokio::task::spawn(async move {
             // Get the object instance at the given path so we can send DBus signal
             // updates
@@ -299,33 +343,28 @@ impl DBusDevice {
 impl TargetInputDevice for DBusDevice {
     fn start_dbus_interface(
         &mut self,
-        dbus: Connection,
-        path: String,
+        dbus: &mut DBusInterfaceManager,
         _client: TargetDeviceClient,
-        type_id: TargetDeviceTypeId,
+        _type_id: TargetDeviceTypeId,
     ) {
-        log::debug!("Starting dbus interface: {path}");
-        self.dbus_path = Some(path.clone());
-        tokio::task::spawn(async move {
-            let generic_interface = TargetInterface::new(&type_id);
-            let iface = TargetDBusInterface::new();
-            let object_server = dbus.object_server();
-            let (gen_result, result) = tokio::join!(
-                object_server.at(path.clone(), generic_interface),
-                object_server.at(path.clone(), iface)
-            );
-            if gen_result.is_err() || result.is_err() {
-                log::debug!("Failed to start dbus interface: {path} generic: {gen_result:?} type-specific: {result:?}");
-            } else {
-                log::debug!("Started dbus interface: {path}");
-            }
-        });
+        self.dbus =
+            DBusInterfaceManager::new(dbus.connection().clone(), dbus.path().to_string()).ok();
+        let iface = TargetDBusInterface::new();
+        dbus.register(iface);
+    }
+
+    fn on_composite_device_attached(
+        &mut self,
+        device: CompositeDeviceClient,
+    ) -> Result<(), InputError> {
+        self.device = Some(device);
+        Ok(())
     }
 
     fn write_event(
         &mut self,
         event: crate::input::event::native::NativeEvent,
-    ) -> Result<(), super::InputError> {
+    ) -> Result<(), InputError> {
         log::trace!("Got event to emit: {:?}", event);
         if self.is_duplicate_event(&event) {
             return Ok(());
@@ -340,9 +379,55 @@ impl TargetInputDevice for DBusDevice {
         Ok(())
     }
 
-    fn get_capabilities(
-        &self,
-    ) -> Result<Vec<crate::input::capability::Capability>, super::InputError> {
+    fn clear_state(&mut self) {
+        let mut release_events = vec![];
+
+        // Release any "pressed" buttons
+        for (capability, value) in self.state.buttons.iter() {
+            if !*value {
+                continue;
+            }
+            let event = NativeEvent::new(capability.clone(), InputValue::Bool(false));
+            release_events.push(event);
+        }
+
+        // Release any axis directions
+        if self.state.pressed_up
+            || self.state.pressed_down
+            || self.state.pressed_left
+            || self.state.pressed_right
+        {
+            let capability = Capability::Gamepad(Gamepad::Axis(GamepadAxis::LeftStick));
+            let value = InputValue::Vector2 {
+                x: Some(0.0),
+                y: Some(0.0),
+            };
+            let event = NativeEvent::new(capability, value);
+            release_events.push(event);
+        }
+
+        // Release any triggers
+        if self.state.pressed_l2 {
+            let capability = Capability::Gamepad(Gamepad::Trigger(GamepadTrigger::LeftTrigger));
+            let value = InputValue::Float(0.0);
+            let event = NativeEvent::new(capability, value);
+            release_events.push(event);
+        }
+        if self.state.pressed_r2 {
+            let capability = Capability::Gamepad(Gamepad::Trigger(GamepadTrigger::RightTrigger));
+            let value = InputValue::Float(0.0);
+            let event = NativeEvent::new(capability, value);
+            release_events.push(event);
+        }
+
+        for event in release_events {
+            if let Err(e) = self.write_event(event) {
+                log::trace!("Failed to write release event: {e}");
+            }
+        }
+    }
+
+    fn get_capabilities(&self) -> Result<Vec<crate::input::capability::Capability>, InputError> {
         let capabilities = vec![
             Capability::DBus(Action::Guide),
             Capability::DBus(Action::Quick),
@@ -373,22 +458,39 @@ impl TargetInputDevice for DBusDevice {
 
         Ok(capabilities)
     }
-
-    fn stop_dbus_interface(&mut self, dbus: Connection, path: String) {
-        log::debug!("Stopping dbus interface for {path}");
-        tokio::task::spawn(async move {
-            let object_server = dbus.object_server();
-            let (target, generic) = tokio::join!(
-                object_server.remove::<TargetDBusInterface, String>(path.clone()),
-                object_server.remove::<TargetInterface, String>(path.clone())
-            );
-            if generic.is_err() || target.is_err() {
-                log::debug!("Failed to stop dbus interface: {path} generic: {generic:?} type-specific: {target:?}");
-            } else {
-                log::debug!("Stopped dbus interface for {path}");
-            }
-        });
-    }
 }
 
-impl TargetOutputDevice for DBusDevice {}
+impl TargetOutputDevice for DBusDevice {
+    fn on_output_capabilities_changed(
+        &mut self,
+        capabilities: HashSet<OutputCapability>,
+    ) -> Result<(), OutputError> {
+        log::info!("Output capabilities changed: {capabilities:?}");
+        let Some(dbus) = self.dbus.as_mut() else {
+            log::warn!("No dbus interface manager set to update interfaces!");
+            return Ok(());
+        };
+
+        // Look for dbus interfaces to start/stop based on output capability
+        let supports_ff = capabilities.contains(&OutputCapability::ForceFeedback);
+        let ff_iface_name = ForceFeedbackInterface::<CompositeDeviceClient>::name();
+
+        // Remove output interfaces if they are no longer supported
+        if !supports_ff {
+            if dbus.has_interface(&ff_iface_name) {
+                dbus.unregister(&ff_iface_name);
+            }
+            return Ok(());
+        }
+        let Some(device) = self.device.clone() else {
+            log::warn!("No composite device was set to start ForceFeedback interface!");
+            return Ok(());
+        };
+
+        // Start the force feedback interface
+        let iface = ForceFeedbackInterface::new(device);
+        dbus.register(iface);
+
+        Ok(())
+    }
+}

@@ -15,13 +15,16 @@ use crate::{
         capability_map::{load_capability_mappings, CapabilityMapConfig},
     },
     constants::BUS_SOURCES_PREFIX,
-    input::composite_device::client::CompositeDeviceClient,
+    input::{
+        capability::Capability, composite_device::client::CompositeDeviceClient,
+        info::DeviceInfoRef, output_capability::OutputCapability,
+    },
     udev::device::UdevDevice,
 };
 
 use self::{blocked::BlockedEventDevice, gamepad::GamepadEventDevice};
 
-use super::{SourceDeviceCompatible, SourceDriver, SourceDriverOptions};
+use super::{OutputError, SourceDeviceCompatible, SourceDriver, SourceDriverOptions};
 
 /// List of available drivers
 enum DriverType {
@@ -41,7 +44,7 @@ pub enum EventDevice {
 }
 
 impl SourceDeviceCompatible for EventDevice {
-    fn get_device_ref(&self) -> &UdevDevice {
+    fn get_device_ref(&self) -> DeviceInfoRef {
         match self {
             EventDevice::Blocked(source_driver) => source_driver.info_ref(),
             EventDevice::Gamepad(source_driver) => source_driver.info_ref(),
@@ -77,14 +80,21 @@ impl SourceDeviceCompatible for EventDevice {
         }
     }
 
-    fn get_capabilities(
-        &self,
-    ) -> Result<Vec<crate::input::capability::Capability>, super::InputError> {
+    fn get_capabilities(&self) -> Result<Vec<Capability>, super::InputError> {
         match self {
             EventDevice::Blocked(source_driver) => source_driver.get_capabilities(),
             EventDevice::Gamepad(source_driver) => source_driver.get_capabilities(),
             EventDevice::Touchscreen(source_driver) => source_driver.get_capabilities(),
             EventDevice::Keyboard(source_driver) => source_driver.get_capabilities(),
+        }
+    }
+
+    fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError> {
+        match self {
+            EventDevice::Blocked(source_driver) => source_driver.get_output_capabilities(),
+            EventDevice::Gamepad(source_driver) => source_driver.get_output_capabilities(),
+            EventDevice::Touchscreen(source_driver) => source_driver.get_output_capabilities(),
+            EventDevice::Keyboard(source_driver) => source_driver.get_output_capabilities(),
         }
     }
 
@@ -127,7 +137,7 @@ impl EventDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -135,7 +145,8 @@ impl EventDevice {
             }
             DriverType::Gamepad => {
                 let device = GamepadEventDevice::new(device_info.clone(), capability_map)?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::Gamepad(source_device))
             }
             DriverType::Touchscreen => {
@@ -145,12 +156,14 @@ impl EventDevice {
                     .and_then(|c| c.touchscreen);
                 let device =
                     TouchscreenEventDevice::new(device_info.clone(), touch_config, capability_map)?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::Touchscreen(source_device))
             }
             DriverType::Keyboard => {
                 let device = KeyboardEventDevice::new(device_info.clone(), &conf, capability_map)?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::Keyboard(source_device))
             }
         }

@@ -16,6 +16,8 @@ use crate::{
     },
 };
 
+use super::Unregisterable;
+
 /// The [CompositeDeviceInterface] provides a DBus interface that can be exposed for managing
 /// a [CompositeDevice]. It works by sending command messages to a channel that the
 /// [CompositeDevice] is listening on.
@@ -106,8 +108,15 @@ impl CompositeDeviceInterface {
     /// current virtual devices for the composite device and create and attach
     /// new target devices.
     async fn set_target_devices(&self, target_device_types: Vec<String>) -> fdo::Result<()> {
+        let mut target_device_type_ids = Vec::with_capacity(target_device_types.len());
+        for kind in target_device_types {
+            let type_id = kind.as_str().try_into().map_err(|_| {
+                fdo::Error::InvalidArgs(format!("Invalid target device type: {kind}"))
+            })?;
+            target_device_type_ids.push(type_id);
+        }
         self.composite_device
-            .set_target_devices(target_device_types)
+            .set_target_devices(target_device_type_ids)
             .await
             .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
@@ -290,6 +299,21 @@ impl CompositeDeviceInterface {
         Ok(capability_strings)
     }
 
+    #[zbus(property)]
+    async fn output_capabilities(&self) -> fdo::Result<Vec<String>> {
+        let capabilities = self
+            .composite_device
+            .get_output_capabilities()
+            .await
+            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        let capability_strings = capabilities
+            .into_iter()
+            .map(|cap| cap.to_string())
+            .collect();
+
+        Ok(capability_strings)
+    }
+
     /// List of capabilities that all target devices implement
     #[zbus(property)]
     async fn target_capabilities(&self) -> fdo::Result<Vec<String>> {
@@ -432,3 +456,5 @@ impl CompositeDeviceInterface {
         });
     }
 }
+
+impl Unregisterable for CompositeDeviceInterface {}

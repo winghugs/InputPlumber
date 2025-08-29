@@ -25,13 +25,13 @@ use crate::config::SourceDevice;
 use crate::constants::BUS_PREFIX;
 use crate::constants::BUS_SOURCES_PREFIX;
 use crate::constants::BUS_TARGETS_PREFIX;
-use crate::dbus::interface::composite_device::CompositeDeviceInterface;
 use crate::dbus::interface::manager::ManagerInterface;
 use crate::dbus::interface::source::evdev::SourceEventDeviceInterface;
 use crate::dbus::interface::source::hidraw::SourceHIDRawInterface;
 use crate::dbus::interface::source::iio_imu::SourceIioImuInterface;
 use crate::dbus::interface::source::led::SourceLedInterface;
 use crate::dbus::interface::source::udev::SourceUdevDeviceInterface;
+use crate::dbus::interface::DBusInterfaceManager;
 use crate::dmi::data::DMIData;
 use crate::dmi::get_cpu_info;
 use crate::dmi::get_dmi_data;
@@ -47,7 +47,9 @@ use crate::udev::device::AttributeGetter;
 use crate::udev::device::UdevDevice;
 
 use super::composite_device::client::CompositeDeviceClient;
+use super::info::DeviceInfo;
 use super::target::client::TargetDeviceClient;
+use super::target::TargetDeviceClass;
 
 use crate::watcher;
 use crate::watcher::WatchEvent;
@@ -76,16 +78,16 @@ pub enum ManagerError {
 #[derive(Debug, Clone)]
 pub enum ManagerCommand {
     DeviceAdded {
-        device: UdevDevice,
+        device: DeviceInfo,
     },
     DeviceRemoved {
-        device: UdevDevice,
+        device: DeviceInfo,
     },
     CreateCompositeDevice {
         config: CompositeDeviceConfig,
     },
     CreateTargetDevice {
-        kind: String,
+        kind: TargetDeviceTypeId,
         sender: mpsc::Sender<Result<String, ManagerError>>,
     },
     StopTargetDevice {
@@ -98,6 +100,9 @@ pub enum ManagerCommand {
     },
     TargetDeviceStopped {
         path: String,
+    },
+    RemoveFromGamepadOrder {
+        device_path: String,
     },
     CompositeDeviceStopped(String),
     GetManageAllDevices {
@@ -113,6 +118,7 @@ pub enum ManagerCommand {
     SetGamepadOrder {
         dbus_paths: Vec<String>,
     },
+    GamepadReorderingFinished,
 }
 
 /// Manages input devices
@@ -128,8 +134,8 @@ pub enum ManagerCommand {
 /// physical gamepads EXCEPT for Steam virtual gamepads.
 /// https://github.com/godotengine/godot/pull/76045
 pub struct Manager {
-    /// The DBus connection
-    dbus: Connection,
+    /// Dbus interface
+    dbus: DBusInterfaceManager,
     /// System DMI data
     dmi_data: DMIData,
     /// System CPU info
@@ -144,9 +150,10 @@ pub struct Manager {
     /// Mapping of source devices to their SourceDevice objects.
     /// E.g. {"evdev://event0": <SourceDevice>}
     source_devices: HashMap<String, SourceDevice>,
-    /// Mapping of source devices to their DBus path
-    /// E.g. {"evdev://event0": "/org/shadowblip/InputPlumber/devices/source/event0"}
-    source_device_dbus_paths: HashMap<String, String>,
+    /// Mapping of source devices to their [DBusInterfaceManager] that contains
+    /// its dbus path and interfaces used.
+    /// E.g. {"evdev://event0": <DBusInterfaceManager>}
+    source_device_dbus_paths: HashMap<String, DBusInterfaceManager>,
     /// Map of source devices being used by a [CompositeDevice].
     /// E.g. {"evdev://event0": "/org/shadowblip/InputPlumber/CompositeDevice0"}
     source_devices_used: HashMap<String, String>,
@@ -169,6 +176,8 @@ pub struct Manager {
     /// List of composite device dbus paths with gamepad devices in player order.
     /// E.g. ["/org/shadowblip/InputPlumber/CompositeDevice0"]
     target_gamepad_order: Vec<String>,
+    /// Whether or not target gamepad reordering is changing.
+    target_gamepad_order_changing: bool,
     /// Defines whether or not InputPlumber should try to automatically manage all
     /// input devices that have a [CompositeDeviceConfig] definition
     manage_all_devices: bool,
@@ -177,6 +186,9 @@ pub struct Manager {
 impl Manager {
     /// Returns a new instance of Gamepad Manager
     pub fn new(conn: Connection) -> Manager {
+        let path = format!("{BUS_PREFIX}/Manager");
+        let dbus = DBusInterfaceManager::new(conn, path).expect("Manager path should be valid");
+
         let (tx, rx) = mpsc::channel(BUFFER_SIZE);
 
         log::debug!("Loading DMI data");
@@ -194,7 +206,7 @@ impl Manager {
         log::debug!("Got CPU info: {cpu_info:?}");
 
         Manager {
-            dbus: conn,
+            dbus,
             dmi_data,
             cpu_info,
             rx,
@@ -209,14 +221,13 @@ impl Manager {
             composite_device_targets: HashMap::new(),
             manage_all_devices: false,
             target_gamepad_order: vec![],
+            target_gamepad_order_changing: false,
         }
     }
 
     /// Starts listening for [Command] messages to be sent from clients and
     /// dispatch those events.
     pub async fn run(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let dbus_for_listen_on_dbus = self.dbus.clone();
-
         let cmd_tx_all_devices = self.tx.clone();
 
         // Watch for hidraw/evdev inotify events.
@@ -241,11 +252,11 @@ impl Manager {
 
         log::debug!("Starting input manager task...");
 
+        self.listen_on_dbus();
         let _ = tokio::join!(
             Self::discover_all_devices(&cmd_tx_all_devices),
             Self::watch_iio_devices(self.tx.clone()),
             Self::watch_devnodes(self.tx.clone(), &mut watcher_rx),
-            Self::listen_on_dbus(dbus_for_listen_on_dbus, self.tx.clone()),
             self.events_loop()
         );
 
@@ -358,20 +369,36 @@ impl Manager {
                         });
                     log::debug!("Used target devices: {:?}", self.composite_device_targets);
 
-                    let is_suspended = match device.is_suspended().await {
-                        Ok(suspended) => suspended,
-                        Err(e) => {
-                            log::debug!("Failed to check if device is suspended: {e:?}");
-                            continue;
+                    // Spawn a new task to query the composite device for its
+                    // suspended state in order to prevent deadlocks.
+                    let tx = self.tx.clone();
+                    let device = device.clone();
+                    tokio::task::spawn(async move {
+                        let is_suspended = match device.is_suspended().await {
+                            Ok(suspended) => suspended,
+                            Err(e) => {
+                                log::debug!("Failed to check if device is suspended: {e:?}");
+                                return;
+                            }
+                        };
+
+                        // If the composite device is suspended, do not remove the
+                        // target device from the gamepad ordering.
+                        if is_suspended {
+                            return;
                         }
-                    };
 
-                    // If the composite device is suspended, do not remove the
-                    // target device from the gamepad ordering.
-                    if is_suspended {
-                        continue;
-                    }
-
+                        // Notify the Manager to remove the gamepad from
+                        // the gamepad order.
+                        if let Err(e) = tx
+                            .send(ManagerCommand::RemoveFromGamepadOrder { device_path })
+                            .await
+                        {
+                            log::debug!("Failed to notify input manager to remove device from gamepad order: {e}");
+                        }
+                    });
+                }
+                ManagerCommand::RemoveFromGamepadOrder { device_path } => {
                     let new_order = self
                         .target_gamepad_order
                         .drain(..)
@@ -383,19 +410,23 @@ impl Manager {
 
                     log::info!("Gamepad order: {:?}", self.target_gamepad_order);
                 }
-                ManagerCommand::DeviceAdded { device } => {
-                    let dev_name = device.name();
-                    let dev_sysname = device.sysname();
+                ManagerCommand::DeviceAdded { device } => match device {
+                    DeviceInfo::Udev(device) => {
+                        let dev_name = device.name();
+                        let dev_sysname = device.sysname();
 
-                    if let Err(e) = self.on_device_added(device).await {
-                        log::error!("Error adding device '{dev_name} ({dev_sysname})': {e}");
+                        if let Err(e) = self.on_udev_device_added(device).await {
+                            log::error!("Error adding device '{dev_name} ({dev_sysname})': {e}");
+                        }
                     }
-                }
-                ManagerCommand::DeviceRemoved { device } => {
-                    if let Err(e) = self.on_device_removed(device).await {
-                        log::error!("Error removing device: {e}");
+                },
+                ManagerCommand::DeviceRemoved { device } => match device {
+                    DeviceInfo::Udev(device) => {
+                        if let Err(e) = self.on_udev_device_removed(device).await {
+                            log::error!("Error removing device: {e}");
+                        }
                     }
-                }
+                },
                 ManagerCommand::SetManageAllDevices(manage_all_devices) => {
                     log::debug!("Setting management of all devices to: {manage_all_devices}");
                     if self.manage_all_devices == manage_all_devices {
@@ -510,6 +541,10 @@ impl Manager {
                 ManagerCommand::SetGamepadOrder { dbus_paths } => {
                     self.set_gamepad_order(dbus_paths).await;
                 }
+                ManagerCommand::GamepadReorderingFinished => {
+                    log::info!("Finished reordering target devices");
+                    self.target_gamepad_order_changing = false;
+                }
             }
         }
 
@@ -529,12 +564,13 @@ impl Manager {
     /// Create a [CompositeDevice] from the given configuration
     async fn create_composite_device_from_config(
         &mut self,
+        path: PathBuf,
         config: &CompositeDeviceConfig,
-        device: UdevDevice,
+        device: DeviceInfo,
     ) -> Result<CompositeDevice, Box<dyn Error>> {
         // Lookup the capability map associated with this config if it exists
         let capability_map = if let Some(map_id) = config.capability_map_id.clone() {
-            log::debug!("Found capability mapping in config: {}", map_id);
+            log::debug!("Found capability mapping in config: {map_id}");
             let capability_map = load_capability_mappings();
             capability_map.get(&map_id).cloned()
         } else {
@@ -542,10 +578,10 @@ impl Manager {
         };
 
         // Create a composite device to manage these devices
-        log::info!("Found matching source device for: {:?}", config.name);
+        log::info!("Found matching source device for config {path:?}");
         let config = config.clone();
         let device = CompositeDevice::new(
-            self.dbus.clone(),
+            self.dbus.connection().clone(),
             self.tx.clone(),
             config,
             device,
@@ -568,31 +604,32 @@ impl Manager {
     }
 
     /// Create target input device to emulate based on the given device type.
-    async fn create_target_device(&mut self, kind: &str) -> Result<TargetDevice, Box<dyn Error>> {
+    /// Returns the DBus path for the device and the device itself.
+    async fn create_target_device(
+        &self,
+        kind: &str,
+    ) -> Result<(String, TargetDevice), Box<dyn Error>> {
         log::trace!("Creating target device: {kind}");
         let Ok(target_id) = TargetDeviceTypeId::try_from(kind) else {
             return Err("Invalid target device ID".to_string().into());
         };
 
         // Create the target device to emulate based on the kind
-        let device = TargetDevice::from_type_id(target_id, self.dbus.clone())?;
+        let path = self.next_target_path(target_id.device_class())?;
+        let dbus = DBusInterfaceManager::new(self.dbus.connection().clone(), path.clone())?;
+        let device = TargetDevice::from_type_id(target_id, dbus)?;
 
-        Ok(device)
+        Ok((path, device))
     }
 
     /// Start and run the given target devices. Returns a HashMap of transmitters
     /// to send events to the given targets.
     async fn start_target_devices(
         &mut self,
-        targets: Vec<TargetDevice>,
+        targets: Vec<(String, TargetDevice)>,
     ) -> Result<HashMap<String, TargetDeviceClient>, Box<dyn Error>> {
         let mut target_devices = HashMap::new();
-        for target in targets {
-            // Get the target device class to determine the DBus path to use for
-            // the device.
-            let device_class = target.dbus_device_class();
-            let path = self.next_target_path(device_class)?;
-
+        for (path, target) in targets {
             // Get a client reference to communicate with the target device
             let Some(client) = target.client() else {
                 log::trace!("No client implemented for target device");
@@ -603,7 +640,7 @@ impl Manager {
 
             // Run the target device
             tokio::spawn(async move {
-                if let Err(e) = target.run(path.clone()).await {
+                if let Err(e) = target.run().await {
                     log::error!("Failed to run target device {path}: {e:?}");
                 }
                 log::debug!("Target device closed at: {path}");
@@ -776,13 +813,23 @@ impl Manager {
             .unwrap();
         sources.push(source_device);
 
-        device.listen_on_dbus().await?;
-
         // Get a handle to the device
         let client = device.client();
 
         // Keep track of target devices that this composite device is using
         let mut target_device_paths = Vec::new();
+
+        // Queue target devices based on the configuration
+        let mut target_devices = Vec::new();
+        if let Some(target_devices_config) = target_types {
+            for kind in target_devices_config {
+                let Ok(target_id) = TargetDeviceTypeId::try_from(kind.as_str()) else {
+                    return Err("Invalid target device ID".to_string().into());
+                };
+                target_devices.push(target_id);
+            }
+        }
+        client.set_target_devices(target_devices).await?;
 
         // Create a DBus target device
         log::debug!("Creating target devices for {composite_path}");
@@ -793,6 +840,7 @@ impl Manager {
             target_device_paths.push(dbus_path.clone());
         }
         device.set_dbus_devices(dbus_devices);
+        device.listen_on_dbus().await?;
 
         // Add the device to our maps
         self.composite_devices
@@ -807,7 +855,6 @@ impl Manager {
 
         // Run the device
         let composite_path = String::from(device.dbus_path());
-        let composite_path_clone = composite_path.clone();
         let tx = self.tx.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = device.run().await {
@@ -827,68 +874,12 @@ impl Manager {
             }
         });
 
-        // Create target devices based on the configuration
-        let mut target_devices = Vec::new();
-        if let Some(target_devices_config) = target_types {
-            for kind in target_devices_config {
-                let device = self.create_target_device(kind.as_str()).await?;
-                target_devices.push(device);
-            }
-        }
-
-        // Start the target input devices
-        let targets = self.start_target_devices(target_devices).await?;
-        let target_paths = targets.keys();
-        for target_path in target_paths {
-            target_device_paths.push(target_path.clone());
-        }
-
-        // Attach the target devices
-        let tx = self.tx.clone();
-        tokio::task::spawn(async move {
-            // Queue the target device attachment to the composite device
-            for target_path in targets.into_keys() {
-                let (sender, mut receiver) = mpsc::channel(1);
-                let result = tx
-                    .send(ManagerCommand::AttachTargetDevice {
-                        target_path,
-                        composite_path: composite_path_clone.clone(),
-                        sender,
-                    })
-                    .await;
-
-                if let Err(e) = result {
-                    log::error!("Failed to send target device attach command to manager: {e:?}");
-                    continue;
-                }
-                tokio::task::spawn(async move {
-                    receiver.recv().await;
-                });
-            }
-        });
-
         Ok(task)
     }
 
     /// Called when a composite device stops running
     async fn on_composite_device_stopped(&mut self, path: String) -> Result<(), Box<dyn Error>> {
         log::debug!("Removing composite device: {}", path);
-
-        // Remove the DBus interface
-        let dbus_path = ObjectPath::from_string_unchecked(path.clone());
-        let conn = self.dbus.clone();
-        task::spawn(async move {
-            log::debug!("Stopping dbus interface: {dbus_path}");
-            let result = conn
-                .object_server()
-                .remove::<CompositeDeviceInterface, ObjectPath>(dbus_path.clone())
-                .await;
-            if let Err(e) = result {
-                log::error!("Failed to remove dbus interface {dbus_path}: {e:?}");
-            } else {
-                log::debug!("Stopped dbus interface: {dbus_path}");
-            }
-        });
 
         // Find any source devices that were in use by the composite device
         let mut to_remove = Vec::new();
@@ -939,8 +930,14 @@ impl Manager {
     async fn on_source_device_added(
         &mut self,
         id: String,
-        device: UdevDevice,
+        device: DeviceInfo,
     ) -> Result<(), Box<dyn Error>> {
+        // Ignore the device if it's already in use.
+        if let Some(device_path) = self.source_devices_used.get(&id) {
+            log::debug!("Source device {id} already in use by {device_path}. Skipping.");
+            return Ok(());
+        }
+
         // Check all existing composite devices to see if this device is part of
         // their config
         'start: for composite_device in self.composite_devices.keys() {
@@ -1020,7 +1017,7 @@ impl Manager {
                 }
             }
 
-            log::info!("Found missing {} device, adding source device {id} to existing composite device: {composite_device:?}", device.subsystem());
+            log::info!("Found missing {} device, adding source device {id} to existing composite device: {composite_device:?}", device.kind());
             let Some(client) = self.composite_devices.get(composite_device.as_str()) else {
                 log::error!("No existing composite device found for key {composite_device:?}");
                 continue;
@@ -1050,8 +1047,8 @@ impl Manager {
         // a match that will automatically create a CompositeDevice.
         let configs = self.load_device_configs().await;
         log::debug!("Checking unused configs");
-        for config in configs {
-            log::trace!("Checking config {:?} for device", config.name);
+        for (path, config) in configs {
+            log::trace!("Checking if config {path:?} matches device",);
 
             // Check to see if 'auto_manage' is enabled for this config.
             let auto_manage = config
@@ -1061,15 +1058,14 @@ impl Manager {
                 .unwrap_or(false);
             if !self.manage_all_devices && !auto_manage {
                 log::trace!(
-                    "Config {:?} does not have 'auto_manage' option enabled. Skipping.",
-                    config.name
+                    "Config {path:?} does not have 'auto_manage' option enabled. Skipping.",
                 );
                 continue;
             }
 
             // Check to see if this configuration matches the system
             if !config.has_valid_matches(&self.dmi_data, &self.cpu_info) {
-                log::trace!("Configuration does not match system");
+                log::trace!("Configuration {path:?} does not match system");
                 continue;
             }
 
@@ -1082,11 +1078,11 @@ impl Manager {
                     }
                 }
                 log::info!(
-                    "Found a matching {} device {id}, creating CompositeDevice",
-                    device.subsystem()
+                    "Found a matching {} device {id} in config {path:?}, creating CompositeDevice",
+                    device.kind()
                 );
                 let dev = self
-                    .create_composite_device_from_config(&config, device)
+                    .create_composite_device_from_config(path, &config, device)
                     .await?;
 
                 // Get the target input devices from the config
@@ -1114,7 +1110,7 @@ impl Manager {
     /// Called when any source device is removed
     async fn on_source_device_removed(
         &mut self,
-        device: UdevDevice,
+        device: DeviceInfo,
         id: String,
     ) -> Result<(), Box<dyn Error>> {
         let dev_name = device.name();
@@ -1145,14 +1141,13 @@ impl Manager {
         }
         sources.remove(idx.unwrap());
         self.source_devices.remove(&id);
-        self.source_device_dbus_paths.remove(&id);
         self.source_devices_used.remove(&id);
 
         Ok(())
     }
 
     /// Called when a new device is detected by udev
-    async fn on_device_added(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
+    async fn on_udev_device_added(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
         let dev_path = device.devpath();
         let dev_name = device.name();
         let dev_sysname = device.sysname();
@@ -1161,7 +1156,6 @@ impl Manager {
             log::debug!("Device discarded for missing sysname: {dev_name} at {dev_path}");
             return Ok(());
         }
-        let sysname = sys_name.clone();
         let dev = device.clone();
 
         log::debug!("Device added: {dev_name} ({dev_sysname}): {dev_path}");
@@ -1172,7 +1166,52 @@ impl Manager {
         // Get the device id
         let id = device.get_id();
 
-        // Create a DBus interface depending on the device subsystem
+        // Create a DBus interface manager for the source device if one does not exist
+        if !self.source_device_dbus_paths.contains_key(&id) {
+            // Get the DBus path based on the device subsystem
+            let path = match subsystem.as_str() {
+                "input" => evdev::get_dbus_path(sys_name),
+                "hidraw" => hidraw::get_dbus_path(sys_name),
+                "iio" => iio::get_dbus_path(sys_name),
+                "leds" => led::get_dbus_path(sys_name),
+                _ => return Err(format!("Device subsystem not supported: {subsystem:?}").into()),
+            };
+            let conn = self.dbus.connection().clone();
+            let mut dbus = DBusInterfaceManager::new(conn, path)?;
+
+            // Register subsystem-specific DBus interfaces
+            match subsystem.as_str() {
+                "input" => {
+                    let evdev_iface = SourceEventDeviceInterface::new(dev);
+                    dbus.register(evdev_iface);
+                }
+                "hidraw" => {
+                    let hidraw_iface = SourceHIDRawInterface::new(dev);
+                    dbus.register(hidraw_iface);
+                }
+                "iio" => {
+                    let iio_iface = SourceIioImuInterface::new(dev);
+                    dbus.register(iio_iface);
+                }
+                "leds" => {
+                    let led_iface = SourceLedInterface::new(dev);
+                    dbus.register(led_iface);
+                }
+                _ => (),
+            }
+
+            // Register the generic udev dbus interface for the device. The
+            // [DBusInterfaceManager] will unregister all interfaces automatically
+            // if it goes out of scope.
+            let udev_iface = SourceUdevDeviceInterface::new(device.clone());
+            dbus.register(udev_iface);
+
+            // Track the lifetime of the source device to keep the dbus interface(s) up
+            self.source_device_dbus_paths.insert(id.clone(), dbus);
+        }
+
+        // Check to see if the device should be managed by inputplumber or not.
+        let mut notify_device_added = true;
         match subsystem.as_str() {
             "input" => {
                 if device.devnode().is_empty() {
@@ -1180,40 +1219,15 @@ impl Manager {
                     return Ok(());
                 }
 
-                log::debug!("Event device added: {dev_name} ({dev_sysname})");
+                log::debug!("event device added: {dev_name} ({dev_sysname})");
 
-                // Create a DBus interface for the event device
-                let conn = self.dbus.clone();
-                let path = evdev::get_dbus_path(sys_name.clone());
-                log::debug!(
-                    "Attempting to listen on dbus for {dev_path} | {dev_name} ({dev_sysname})"
-                );
-
-                let dbus_path = path.clone();
-                task::spawn(async move {
-                    let result = SourceUdevDeviceInterface::listen_on_dbus(
-                        conn.clone(),
-                        dbus_path.as_str(),
-                        sysname.as_str(),
-                        dev.clone(),
-                    )
-                    .await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source udev dbus interface: {e:?}");
+                // Check to see if the device should be managed or not
+                'check_manage: {
+                    if !device.is_virtual() {
+                        log::trace!("{dev_name} ({dev_sysname}) is a real device - {dev_path}");
+                        break 'check_manage;
                     }
-                    let result =
-                        SourceEventDeviceInterface::listen_on_dbus(conn, sysname, dev).await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source evdev dbus interface: {e:?}");
-                    }
-                    log::debug!("Finished adding source device on dbus");
-                });
 
-                // Add the device as a source device
-                self.source_device_dbus_paths.insert(id.clone(), path);
-
-                // Check to see if the device is virtual
-                if device.is_virtual() {
                     // Look up the connected device using udev
                     let device_info = udev::get_device(dev_path.clone()).await?;
 
@@ -1238,7 +1252,7 @@ impl Manager {
 
                     if !is_bluetooth && !is_whitelisted {
                         log::debug!("{dev_name} ({dev_sysname}) is virtual, skipping consideration for {dev_path}");
-                        return Ok(());
+                        notify_device_added = false;
                     }
                     if is_bluetooth {
                         log::debug!("{dev_name} ({dev_sysname}) is a virtual device node for a bluetooth device. Treating as real - {dev_path}");
@@ -1246,15 +1260,9 @@ impl Manager {
                     if is_whitelisted {
                         log::debug!("{dev_name} ({dev_sysname}) is a virtual device node for a whitelisted device. Treating as real - {dev_path}")
                     }
-                } else {
-                    log::trace!("{dev_name} ({dev_sysname}) is a real device - {dev_path}");
                 }
-
-                // Signal that a source device was added
-                log::debug!("Spawning task to add source device: {id}");
-                self.on_source_device_added(id.clone(), device).await?;
-                log::debug!("Finished adding {id}");
             }
+
             "hidraw" => {
                 if device.devnode().is_empty() {
                     log::debug!("hidraw device discarded for missing devnode: {dev_name} ({dev_sysname}) at {dev_path}");
@@ -1263,48 +1271,28 @@ impl Manager {
 
                 log::debug!("hidraw device added: {dev_name} ({dev_sysname})");
 
-                // Create a DBus interface for the event device
-                let conn = self.dbus.clone();
-                let path = hidraw::get_dbus_path(sys_name.clone());
-
-                log::debug!("Attempting to listen on dbus for {dev_path} | {dev_sysname}");
-                let dbus_path = path.clone();
-                task::spawn(async move {
-                    let result = SourceUdevDeviceInterface::listen_on_dbus(
-                        conn.clone(),
-                        dbus_path.as_str(),
-                        sysname.as_str(),
-                        dev.clone(),
-                    )
-                    .await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source udev dbus interface: {e:?}");
+                // Check to see if the device should be managed or not
+                'check_manage: {
+                    if !device.is_virtual() {
+                        log::trace!("{dev_name} ({dev_sysname})  is a real device -{dev_path}");
+                        break 'check_manage;
                     }
-                    let result = SourceHIDRawInterface::listen_on_dbus(conn, sysname, dev).await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source evdev dbus interface: {e:?}");
-                    }
-                    log::debug!("Finished adding source device on dbus");
-                });
 
-                // Add the device as a source device
-                self.source_device_dbus_paths.insert(id.clone(), path);
-
-                // Check to see if the device is virtual
-                if device.is_virtual() {
                     // Check to see if this virtual device is a bluetooth device
                     let uniq = device.uniq();
                     if uniq.is_empty() {
                         log::debug!("{dev_name} ({dev_sysname}) is virtual, skipping consideration for {dev_path}.");
-                        return Ok(());
+                        notify_device_added = false;
+                        break 'check_manage;
                     };
 
                     // Check bluez to see if that uniq is a bluetooth device
-                    let object_manager = zbus::fdo::ObjectManagerProxy::builder(&self.dbus)
-                        .destination("org.bluez")?
-                        .path("/")?
-                        .build()
-                        .await?;
+                    let object_manager =
+                        zbus::fdo::ObjectManagerProxy::builder(self.dbus.connection())
+                            .destination("org.bluez")?
+                            .path("/")?
+                            .build()
+                            .await?;
                     let objects: ManagedObjects = object_manager.get_managed_objects().await?;
 
                     // Check each dbus object for a connected device
@@ -1317,7 +1305,7 @@ impl Manager {
                         }
 
                         // Get a reference to the device
-                        let bt_device = Device1Proxy::builder(&self.dbus)
+                        let bt_device = Device1Proxy::builder(self.dbus.connection())
                             .destination("org.bluez")?
                             .path(path)?
                             .build()
@@ -1341,17 +1329,11 @@ impl Manager {
 
                     if !matches_bluetooth {
                         log::debug!("{dev_name} ({dev_sysname}) is virtual, skipping consideration for {dev_path}.");
-                        return Ok(());
+                        notify_device_added = false;
+                        break 'check_manage;
                     }
                     log::debug!("{dev_name} ({dev_sysname}) is a virtual device node for a bluetooth device. Treating as real - {dev_path}");
-                } else {
-                    log::trace!("{dev_name} ({dev_sysname})  is a real device -{dev_path}");
                 }
-
-                // Signal that a source device was added
-                log::debug!("Spawing task to add source device: {id}");
-                self.on_source_device_added(id.clone(), device).await?;
-                log::debug!("Finished adding hidraw device {id}");
             }
 
             "iio" => {
@@ -1362,70 +1344,25 @@ impl Manager {
 
                 log::debug!("iio device added: {} ({})", device.name(), device.sysname());
 
-                // Create a DBus interface for the event device
-                let conn = self.dbus.clone();
-                let path = iio::get_dbus_path(sys_name.clone());
-
-                log::debug!("Attempting to listen on dbus for device {dev_name} ({dev_sysname}) | {dev_path}");
-                let dbus_path = path.clone();
-                task::spawn(async move {
-                    let result = SourceUdevDeviceInterface::listen_on_dbus(
-                        conn.clone(),
-                        dbus_path.as_str(),
-                        sysname.as_str(),
-                        dev.clone(),
-                    )
-                    .await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source udev dbus interface: {e:?}");
-                    }
-
-                    let result = SourceIioImuInterface::listen_on_dbus(conn, dev).await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source evdev dbus interface: {e:?}");
-                    }
-                    log::debug!("Finished adding source device on dbus");
-                });
-
-                // Add the device as a source device
-                self.source_device_dbus_paths.insert(id.clone(), path);
-
                 // Check to see if the device is virtual
                 if device.is_virtual() {
                     log::debug!("{dev_name} ({dev_sysname}) is virtual, skipping consideration for {dev_path}");
-                    return Ok(());
+                    notify_device_added = false;
                 } else {
                     log::trace!("Device {dev_name} ({dev_sysname}) is real - {dev_path}");
                 }
-
-                // Signal that a source device was added
-                log::debug!("Spawing task to add source device: {id}");
-                self.on_source_device_added(id.clone(), device).await?;
-                log::debug!("Finished adding event device {id}");
             }
 
             "leds" => {
                 log::debug!("LED device added: {} ({})", device.name(), device.sysname());
 
-                // Create a DBus interface for the LED device
-                let conn = self.dbus.clone();
-                log::debug!("Attempting to listen on dbus for {dev_path} | {sysname}");
-                task::spawn(async move {
-                    let result = SourceLedInterface::listen_on_dbus(conn, dev).await;
-                    if let Err(e) = result {
-                        log::error!("Error creating source evdev dbus interface: {e:?}");
-                    }
-                    log::debug!("Finished adding source device on dbus");
-                });
-
-                // Add the device as a source device
-                let path = led::get_dbus_path(sys_name.clone());
-                self.source_device_dbus_paths.insert(id.clone(), path);
-
-                // Signal that a source device was added
-                log::debug!("Spawing task to add source device: {id}");
-                self.on_source_device_added(id.clone(), device).await?;
-                log::debug!("Finished adding LED device {id}");
+                // Check to see if the device is virtual
+                if device.is_virtual() {
+                    log::debug!("{dev_name} ({dev_sysname}) is virtual, skipping consideration for {dev_path}");
+                    notify_device_added = false;
+                } else {
+                    log::trace!("Device {dev_name} ({dev_sysname}) is real - {dev_path}");
+                }
             }
 
             _ => {
@@ -1433,74 +1370,41 @@ impl Manager {
             }
         };
 
+        // Signal that a source device was added
+        if notify_device_added {
+            log::debug!("Spawning task to add source device: {id}");
+            self.on_source_device_added(id.clone(), device.into())
+                .await?;
+            log::debug!("Finished adding {id}");
+        }
+
         Ok(())
     }
 
-    async fn on_device_removed(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
+    async fn on_udev_device_removed(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
         let dev_name = device.name();
         let sys_name = device.sysname();
-        let subsystem = device.subsystem();
         log::debug!("Device removed: {dev_name} ({sys_name})");
         let path = ObjectPath::from_string_unchecked(format!("{BUS_SOURCES_PREFIX}/{sys_name}"));
         log::debug!("Device dbus path: {path}");
-        let conn = self.dbus.clone();
-        task::spawn(async move {
-            log::debug!("Stopping dbus interfaces: {path}");
-
-            // Stop generic interfaces
-            let result = conn
-                .object_server()
-                .remove::<SourceUdevDeviceInterface, ObjectPath>(path.clone())
-                .await;
-            if let Err(e) = result {
-                log::error!("Failed to remove udev dbus interface {path}: {e:?}");
-            } else {
-                log::debug!("Stopped udev dbus interface: {path}");
-            }
-
-            // Stop subsystem-specific interfaces
-            let result = match subsystem.as_str() {
-                "input" => {
-                    conn.object_server()
-                        .remove::<SourceEventDeviceInterface, ObjectPath>(path.clone())
-                        .await
-                }
-                "hidraw" => {
-                    conn.object_server()
-                        .remove::<SourceHIDRawInterface, ObjectPath>(path.clone())
-                        .await
-                }
-                "iio" => {
-                    conn.object_server()
-                        .remove::<SourceIioImuInterface, ObjectPath>(path.clone())
-                        .await
-                }
-                _ => Err(zbus::Error::Failure(format!(
-                    "Invalid subsystem: '{subsystem}'"
-                ))),
-            };
-            if let Err(e) = result {
-                log::error!("Failed to remove dbus interface {path}: {e:?}");
-            } else {
-                log::debug!("Stopped dbus interface: {path}");
-            }
-        });
 
         let id = device.get_id();
 
         if id.is_empty() {
+            log::warn!("Removed device had an empty id: {device:?}");
             return Ok(());
         }
         log::debug!("Device ID: {id}");
 
         // Signal that a source device was removed
-        self.on_source_device_removed(device, id).await?;
+        self.source_device_dbus_paths.remove(&id);
+        self.on_source_device_removed(device.into(), id).await?;
 
         Ok(())
     }
 
     /// Returns the next available target device dbus path
-    fn next_target_path(&self, kind: &str) -> Result<String, Box<dyn Error>> {
+    fn next_target_path(&self, kind: TargetDeviceClass) -> Result<String, Box<dyn Error>> {
         let max = 2048;
         let mut i = 0;
         loop {
@@ -1668,15 +1572,15 @@ impl Manager {
                 WatchEvent::Delete { name, base_path } => {
                     let device = UdevDevice::from_devnode(base_path.as_str(), name.as_str());
                     log::debug!("Got inotify remove action for {base_path}/{name}");
-                    let result = cmd_tx.send(ManagerCommand::DeviceRemoved { device }).await;
+                    let result = cmd_tx
+                        .send(ManagerCommand::DeviceRemoved {
+                            device: device.into(),
+                        })
+                        .await;
                     if let Err(e) = result {
                         log::error!("Unable to send command: {:?}", e);
                     }
                 }
-                WatchEvent::Modify {
-                    name: _,
-                    base_path: _,
-                } => (),
             }
         }
     }
@@ -1707,7 +1611,9 @@ impl Manager {
     ) -> Result<(), Box<dyn Error>> {
         for device in devices {
             manager_tx
-                .send(ManagerCommand::DeviceAdded { device })
+                .send(ManagerCommand::DeviceAdded {
+                    device: device.into(),
+                })
                 .await?;
         }
 
@@ -1717,10 +1623,10 @@ impl Manager {
     /// Looks in all default locations for [CompositeDeviceConfig] definitions and
     /// load/parse them. Returns an array of these configs which can be used
     /// to automatically create a [CompositeDevice].
-    pub async fn load_device_configs(&self) -> Vec<CompositeDeviceConfig> {
+    pub async fn load_device_configs(&self) -> Vec<(PathBuf, CompositeDeviceConfig)> {
         let task = task::spawn_blocking(move || {
             log::trace!("Loading device configurations");
-            let mut devices: Vec<CompositeDeviceConfig> = Vec::new();
+            let mut devices: Vec<(PathBuf, CompositeDeviceConfig)> = Vec::new();
             let paths = get_devices_paths();
             let files = get_multidir_sorted_files(paths.as_slice(), |entry| {
                 entry.path().extension().unwrap_or_default() == "yaml"
@@ -1740,7 +1646,7 @@ impl Manager {
                     continue;
                 }
                 let device = device.unwrap();
-                devices.push(device);
+                devices.push((file, device));
             }
 
             devices
@@ -1755,22 +1661,14 @@ impl Manager {
     }
 
     /// Creates a DBus object and return the (active) handle to the listener
-    async fn listen_on_dbus(
-        dbus: Connection,
-        tx: mpsc::Sender<ManagerCommand>,
-    ) -> tokio::task::JoinHandle<()> {
-        let iface = ManagerInterface::new(tx);
-        let manager_path = format!("{}/Manager", BUS_PREFIX);
-        task::spawn(async move {
-            if let Err(e) = dbus.object_server().at(manager_path, iface).await {
-                log::error!("Failed create manager dbus interface: {e:?}");
-            }
-        })
+    fn listen_on_dbus(&mut self) {
+        let iface = ManagerInterface::new(self.tx.clone());
+        self.dbus.register(iface);
     }
 
     async fn add_device_to_composite_device(
         &self,
-        device: UdevDevice,
+        device: DeviceInfo,
         client: &CompositeDeviceClient,
     ) -> Result<(), Box<dyn Error>> {
         client.add_source_device(device).await?;
@@ -1783,7 +1681,7 @@ impl Manager {
         self.target_gamepad_order = order.clone();
 
         // Update the gamepad order on the dbus interface
-        let conn = self.dbus.clone();
+        let conn = self.dbus.connection().clone();
         tokio::task::spawn(async move {
             if let Err(e) = ManagerInterface::update_target_gamepad_order(&conn, order).await {
                 log::warn!("Failed to emit gamepad order changed signal: {e}");
@@ -1794,6 +1692,17 @@ impl Manager {
     /// Set the player order of the given composite device paths. Each device
     /// will be suspended and resumed in player order.
     async fn set_gamepad_order(&mut self, order: Vec<String>) {
+        // If gamepad reordering is already in progress, requeue the request
+        let tx = self.tx.clone();
+        if self.target_gamepad_order_changing {
+            log::debug!("Gamepad reordering in progress. Requeuing reordering request.");
+            tokio::task::spawn(async move {
+                let _ = tx
+                    .send(ManagerCommand::SetGamepadOrder { dbus_paths: order })
+                    .await;
+            });
+            return;
+        }
         log::info!("Setting player order to: {order:?}");
 
         // Ensure the given paths are valid composite device paths
@@ -1814,6 +1723,8 @@ impl Manager {
             .map(|path| self.composite_devices.get(&path).unwrap().clone())
             .collect();
 
+        self.target_gamepad_order_changing = true;
+
         tokio::task::spawn(async move {
             // Suspend all composite devices
             for device in devices.iter() {
@@ -1833,8 +1744,11 @@ impl Manager {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        });
 
-        //
+            // Notify the manager that gamepad reordering has completed
+            if let Err(e) = tx.send(ManagerCommand::GamepadReorderingFinished).await {
+                log::error!("Failed to signal gamepad reordering finished. This is bad: {e:?}");
+            }
+        });
     }
 }

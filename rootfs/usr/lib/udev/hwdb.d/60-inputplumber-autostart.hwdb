@@ -20,6 +20,8 @@ dmi:*svnAYANEO:pnAYANEO2021:*
 dmi:*svnAYANEO:pnAYANEO2021Pro:*
 dmi:*svnAYANEO:pnAYANEO2021ProRetroPower:*
 dmi:*svnAYANEO:pnAYANEOFOUNDER:*
+# AYANEO 3
+dmi:*svnAYANEO:pnAYANEO3:*
 # AYANEO Air
 dmi:*svnAYANEO:pnAIR1S:*
 dmi:*svnAYANEO:pnAIR1SLimited:*
@@ -69,6 +71,7 @@ dmi:*svnLENOVO:pn83N1:*
 # MSI Claw
 dmi:*:svnMicro-StarInternationalCo.,Ltd.:pnClaw7AI+A2VM:*
 dmi:*:svnMicro-StarInternationalCo.,Ltd.:pnClaw8AI+A2VM:*
+dmi:*:svnMicro-StarInternationalCo.,Ltd.:pnClawA8BZ2EM:*
 dmi:*:svnMicro-StarInternationalCo.,Ltd.:pnClawA1M:*
 # OneXPlayer Old models
 dmi:*svnONE-NETBOOK:pnONEXPLAYER:*
@@ -88,6 +91,9 @@ dmi:*svnONE-NETBOOK:pnONEXPLAYERF1Pro:*
 dmi:*svnONE-NETBOOK:pnONEXPLAYERX1A:*
 dmi:*svnONE-NETBOOK:pnONEXPLAYERX1i:*
 dmi:*svnONE-NETBOOK:pnONEXPLAYERX1mini:*
+# OneXPlayer G1
+dmi:*svnONE-NETBOOK:*pnONEXPLAYERG1A:*
+dmi:*svnONE-NETBOOK:*pnONEXPLAYERG1i:*
 # OrangePi Neo
 dmi:*svnOrangePi:pnNEO-01:*
 # Zotac Zone

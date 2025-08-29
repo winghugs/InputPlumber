@@ -10,8 +10,10 @@ use zbus::Connection;
 use crate::{
     dbus::interface::composite_device::CompositeDeviceInterface,
     input::{
-        capability::Capability, event::native::NativeEvent, manager::ManagerCommand,
-        target::client::TargetDeviceClient,
+        capability::Capability,
+        event::native::NativeEvent,
+        manager::ManagerCommand,
+        target::{client::TargetDeviceClient, TargetDeviceTypeId},
     },
 };
 
@@ -42,7 +44,7 @@ pub struct CompositeDeviceTargets {
     target_devices_queued: HashSet<String>,
     /// List of active target device types (e.g. "deck", "ds5", "xb360") that
     /// were active before system suspend.
-    target_devices_suspended: Vec<String>,
+    target_devices_suspended: Vec<TargetDeviceTypeId>,
     /// Map of DBusDevice DBus paths to their respective transmitter channel.
     /// E.g. {"/org/shadowblip/InputPlumber/devices/target/dbus0": <Sender>}
     target_dbus_devices: HashMap<String, TargetDeviceClient>,
@@ -83,19 +85,44 @@ impl CompositeDeviceTargets {
 
     /// Returns the list of active target device types (e.g. "deck", "ds5", "xb360")
     /// that were active before system suspend.
-    pub fn get_suspended_devices(&self) -> Vec<String> {
+    pub fn get_suspended_devices(&self) -> Vec<TargetDeviceTypeId> {
         self.target_devices_suspended.clone()
     }
 
     /// Sets the DBus target devices attached to a [CompositeDevice]
     pub fn set_dbus_devices(&mut self, devices: HashMap<String, TargetDeviceClient>) {
+        // Notify the dbus device of the source device(s) capabilities
+        for dbus_device in devices.values() {
+            let device = self.device.clone();
+            let target = dbus_device.clone();
+            tokio::task::spawn(async move {
+                let source_capabilities = device.get_capabilities().await.unwrap_or_default();
+                let source_output_capabilities =
+                    device.get_output_capabilities().await.unwrap_or_default();
+                target
+                    .set_composite_device(device)
+                    .await
+                    .unwrap_or_default();
+                target
+                    .notify_capabilities_changed(source_capabilities)
+                    .await
+                    .unwrap_or_default();
+                target
+                    .notify_output_capabilities_changed(source_output_capabilities)
+                    .await
+                    .unwrap_or_default();
+            });
+        }
         self.target_dbus_devices = devices;
     }
 
     /// Set the given target devices on the composite device. This will create
     /// new target devices, attach them to this device, and stop/remove any
     /// existing devices.
-    pub async fn set_devices(&mut self, device_types: Vec<String>) -> Result<(), Box<dyn Error>> {
+    pub async fn set_devices(
+        &mut self,
+        device_types: Vec<TargetDeviceTypeId>,
+    ) -> Result<(), Box<dyn Error>> {
         let dbus_path = self.path.as_str();
         log::info!("[{dbus_path}] Setting target devices: {device_types:?}");
 
@@ -123,14 +150,14 @@ impl CompositeDeviceTargets {
         }
 
         // Identify which target devices are new
-        let mut device_types_to_start: Vec<String> = vec![];
+        let mut device_types_to_start: Vec<TargetDeviceTypeId> = vec![];
         for kind in device_types.iter() {
             if self.target_kind_running(kind).await? {
                 log::debug!("[{dbus_path}] Target device {kind} already running, nothing to do.");
                 continue;
             }
 
-            device_types_to_start.push(kind.clone());
+            device_types_to_start.push(*kind);
         }
 
         // Identify the targets that need to close
@@ -231,12 +258,7 @@ impl CompositeDeviceTargets {
     }
 
     // Deterimines if a given target device kind is already running
-    async fn target_kind_running(&self, kind: &str) -> Result<bool, Box<dyn Error>> {
-        // TODO: Save this on the DS5 target device so we can properly look it up.
-        let kind = match kind {
-            "ds5" => "ds5_edge",
-            _ => kind,
-        };
+    async fn target_kind_running(&self, kind: &TargetDeviceTypeId) -> Result<bool, Box<dyn Error>> {
         for target in self.target_devices.values() {
             let target_type = match target.get_type().await {
                 Ok(value) => value,
@@ -244,7 +266,7 @@ impl CompositeDeviceTargets {
                     return Err(format!("Failed to request target type: {e:?}").into());
                 }
             };
-            if kind == target_type {
+            if *kind == target_type {
                 return Ok(true);
             }
         }
@@ -276,7 +298,19 @@ impl CompositeDeviceTargets {
         // Only write the event to devices that are capable of handling it
         log::trace!("[{}] Emit passed event: {event:?}", self.path);
         for (name, target) in target_devices {
-            if let Err(e) = target.write_event(event.clone()).await {
+            let mut event = event.clone();
+            if let Some(context) = event.get_context_mut() {
+                context
+                    .metrics_mut()
+                    .get_mut("composite_device")
+                    .unwrap()
+                    .finish();
+                context
+                    .metrics_mut()
+                    .create_child_span("root", "target_send")
+                    .start();
+            }
+            if let Err(e) = target.write_event(event).await {
                 log::error!("Failed to write event to: {name}: {e:?}");
             }
         }
@@ -424,6 +458,23 @@ impl CompositeDeviceTargets {
                 );
             }
             log::debug!("[{dbus_path}] Attached device {path}");
+
+            // Notify the target device of the supported source capabilities
+            let device = self.device.clone();
+            let target_clone = target.clone();
+            tokio::task::spawn(async move {
+                let source_capabilities = device.get_capabilities().await.unwrap_or_default();
+                let source_output_capabilities =
+                    device.get_output_capabilities().await.unwrap_or_default();
+                target_clone
+                    .notify_capabilities_changed(source_capabilities)
+                    .await
+                    .unwrap_or_default();
+                target_clone
+                    .notify_output_capabilities_changed(source_output_capabilities)
+                    .await
+                    .unwrap_or_default();
+            });
 
             // Track the target device by capabilities it has
             for cap in caps {

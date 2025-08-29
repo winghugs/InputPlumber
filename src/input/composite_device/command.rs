@@ -7,10 +7,11 @@ use crate::{
     input::{
         capability::Capability,
         event::{native::NativeEvent, Event},
+        info::DeviceInfo,
+        output_capability::OutputCapability,
         output_event::OutputEvent,
-        target::client::TargetDeviceClient,
+        target::{client::TargetDeviceClient, TargetDeviceTypeId},
     },
-    udev::device::UdevDevice,
 };
 
 use super::InterceptMode;
@@ -23,9 +24,11 @@ pub enum CompositeCommand {
     AttachTargetDevices(HashMap<String, TargetDeviceClient>),
     GetConfig(mpsc::Sender<CompositeDeviceConfig>),
     GetCapabilities(mpsc::Sender<HashSet<Capability>>),
+    GetOutputCapabilities(mpsc::Sender<HashSet<OutputCapability>>),
     GetDBusDevicePaths(mpsc::Sender<Vec<String>>),
     GetInterceptMode(mpsc::Sender<InterceptMode>),
     GetName(mpsc::Sender<String>),
+    #[allow(dead_code)]
     GetProfileName(mpsc::Sender<String>),
     GetSourceDevicePaths(mpsc::Sender<Vec<String>>),
     GetTargetCapabilities(mpsc::Sender<HashSet<Capability>>),
@@ -38,10 +41,11 @@ pub enum CompositeCommand {
     RemoveRecentEvent(Capability),
     SetInterceptActivation(Vec<Capability>, Capability),
     SetInterceptMode(InterceptMode),
-    SetTargetDevices(Vec<String>),
-    SourceDeviceAdded(UdevDevice),
-    SourceDeviceRemoved(UdevDevice),
-    SourceDeviceStopped(UdevDevice),
+    SetTargetDevices(Vec<TargetDeviceTypeId>),
+    SourceDeviceAdded(DeviceInfo),
+    SourceDeviceRemoved(DeviceInfo),
+    SourceDeviceStopped(DeviceInfo),
+    #[allow(dead_code)]
     UpdateSourceCapabilities(String, HashSet<Capability>),
     UpdateTargetCapabilities(String, HashSet<Capability>),
     WriteChordEvent(Vec<NativeEvent>),

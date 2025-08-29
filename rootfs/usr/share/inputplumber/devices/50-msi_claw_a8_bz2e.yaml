@@ -6,7 +6,7 @@ version: 1
 kind: CompositeDevice
 
 # Name of the composite device mapping
-name: Lenovo Legion Go 2
+name: MSI Claw A8 BZ2EM
 
 # Only allow a single source device per composite device of this type.
 single_source: false
@@ -16,56 +16,34 @@ single_source: false
 # /sys/class/dmi/id/product_name
 matches:
   - dmi_data:
-      product_name: "{83N0,83N1}"
-      sys_vendor: LENOVO
-      cpu_vendor: AuthenticAMD
+      product_name: "Claw A8 BZ2EM"
+      sys_vendor: "Micro-Star International Co., Ltd."
 
 # One or more source devices to combine into a single virtual device. The events
 # from these devices will be watched and translated according to the key map.
 source_devices:
-  ## XInput - Connected 0x61eb
-  # Touchpad
-  - group: mouse # Gamepad Mode
-    hidraw:
-      vendor_id: 0x17ef
-      product_id: 0x61eb
-      interface_num: 1
+  # Extra Buttons
+  - group: keyboard
+    evdev:
+      name: AT Translated Set 2 keyboard
+      phys_path: isa0060/serio0/input0
+
   # Gamepad
   - group: gamepad
+    evdev:
+      vendor_id: "0db0"
+      product_id: "1901"
+      phys_path: "usb-0000:c6:00.0-3/input0"
+  - group: gamepad
+    passthrough: true
     hidraw:
-      vendor_id: 0x17ef
-      product_id: 0x61eb
+      vendor_id: 0x0db0
+      product_id: 0x1901
       interface_num: 2
-  - group: gamepad
-    unique: true
-    evdev:
-      name: "{Lenovo Legion Controller for Windows,Generic X-Box pad}"
-      vendor_id: "17ef"
-      product_id: "61eb"
-      handler: event*
-  # Block all evdev devices; mouse, touchpad, keyboard
-  - group: gamepad
-    blocked: true
-    unique: false
-    evdev:
-      name: "  Legion Controller for Windows  *"
-      vendor_id: "17ef"
-      product_id: "61eb"
-      handler: event*
 
-  # Touchscreen
-  #- group: touchscreen
-  #  udev:
-  #    properties:
-  #      - name: ID_INPUT_TOUCHSCREEN
-  #        value: "1"
-  #    sys_name: "event*"
-  #    subsystem: input
-  #  config:
-  #    touchscreen:
-  #      orientation: "left"
+  # IMU
+
 # Optional configuration for the composite device
-
 options:
   # If true, InputPlumber will automatically try to manage the input device. If
   # this is false, InputPlumber will not try to manage the device unless an
@@ -76,6 +54,7 @@ options:
 target_devices:
   - xbox-elite
   - mouse
-  #- keyboard
-  #- touchpad
-  #- touchscreen
+  - keyboard
+
+# The ID of a device event mapping in the 'event_maps' folder
+capability_map_id: claw1

@@ -13,11 +13,7 @@ use std::{
 
 use evdev::InputEvent;
 use targets::CompositeDeviceTargets;
-use tokio::{
-    sync::mpsc,
-    task::{JoinHandle, JoinSet},
-    time::Duration,
-};
+use tokio::{sync::mpsc, task::JoinSet, time::Duration};
 use zbus::Connection;
 
 use crate::{
@@ -25,9 +21,7 @@ use crate::{
         capability_map::CapabilityMapConfig, path::get_profiles_path, CompositeDeviceConfig,
         DeviceProfile, ProfileMapping,
     },
-    dbus::interface::{
-        composite_device::CompositeDeviceInterface, source::iio_imu::SourceIioImuInterface,
-    },
+    dbus::interface::{composite_device::CompositeDeviceInterface, DBusInterfaceManager},
     input::{
         capability::{Capability, Gamepad, GamepadButton, Mouse},
         event::{
@@ -35,19 +29,21 @@ use crate::{
             value::{InputValue, TranslationError},
             Event,
         },
+        output_capability::OutputCapability,
         output_event::UinputOutputEvent,
         source::{
             evdev::EventDevice, hidraw::HidRawDevice, iio::IioDevice, led::LedDevice, SourceDevice,
         },
+        target::TargetDeviceTypeId,
     },
-    udev::{device::UdevDevice, hide_device, unhide_device},
+    udev::{hide_device, unhide_device},
 };
 
 use self::{client::CompositeDeviceClient, command::CompositeCommand};
 
 use super::{
-    manager::ManagerCommand, output_event::OutputEvent, source::client::SourceDeviceClient,
-    target::client::TargetDeviceClient,
+    info::DeviceInfo, manager::ManagerCommand, output_event::OutputEvent,
+    source::client::SourceDeviceClient, target::client::TargetDeviceClient,
 };
 
 /// Size of the command channel buffer for processing input events and commands.
@@ -73,14 +69,16 @@ pub enum InterceptMode {
 /// can translate input to any target devices
 #[derive(Debug)]
 pub struct CompositeDevice {
-    /// Connection to DBus
-    conn: Connection,
+    /// DBus interface(s) for this device
+    dbus: DBusInterfaceManager,
     /// Configuration for the CompositeDevice
     config: CompositeDeviceConfig,
     /// Name of the [CompositeDeviceConfig] loaded for the device
     name: String,
     /// Capabilities describe all input capabilities from all source devices
     capabilities: HashSet<Capability>,
+    /// Output capabilities describe all output capabilities from all source devices
+    output_capabilities: HashSet<OutputCapability>,
     /// Capability mapping for the CompositeDevice
     capability_map: Option<CapabilityMapConfig>,
     /// Currently loaded [DeviceProfile] for the [CompositeDevice]. The [DeviceProfile]
@@ -104,8 +102,6 @@ pub struct CompositeDevice {
     /// Keep track of translated events we've emitted so we can send
     /// release events
     emitted_mappings: HashSet<String>,
-    /// The DBus path this [CompositeDevice] is listening on
-    dbus_path: String,
     /// Mode defining how inputs should be routed
     intercept_mode: InterceptMode,
     /// Transmit channel for sending commands to this composite device
@@ -160,18 +156,20 @@ impl CompositeDevice {
         conn: Connection,
         manager: mpsc::Sender<ManagerCommand>,
         config: CompositeDeviceConfig,
-        device_info: UdevDevice,
+        device_info: DeviceInfo,
         dbus_path: String,
         capability_map: Option<CapabilityMapConfig>,
     ) -> Result<Self, Box<dyn Error>> {
         log::info!("Creating CompositeDevice with config: {}", config.name);
         let (tx, rx) = mpsc::channel(BUFFER_SIZE);
         let name = config.name.clone();
+        let dbus = DBusInterfaceManager::new(conn.clone(), dbus_path.clone())?;
         let mut device = Self {
-            conn: conn.clone(),
+            dbus,
             config,
             name,
             capabilities: HashSet::new(),
+            output_capabilities: HashSet::new(),
             capability_map,
             device_profile: None,
             device_profile_path: None,
@@ -180,7 +178,6 @@ impl CompositeDevice {
             translatable_active_inputs: Vec::new(),
             translated_recent_events: HashSet::new(),
             emitted_mappings: HashSet::new(),
-            dbus_path: dbus_path.clone(),
             intercept_mode: InterceptMode::None,
             tx: tx.clone(),
             rx,
@@ -249,33 +246,24 @@ impl CompositeDevice {
 
     /// Return the DBus path of the composite device
     pub fn dbus_path(&self) -> &str {
-        self.dbus_path.as_str()
+        self.dbus.path()
     }
 
     /// Creates a new instance of the composite device interface on DBus.
-    pub async fn listen_on_dbus(&self) -> Result<JoinHandle<()>, Box<dyn Error>> {
-        let conn = self.conn.clone();
+    pub async fn listen_on_dbus(&mut self) -> Result<(), Box<dyn Error>> {
         let client = self.client();
-        let path = String::from(self.dbus_path());
         let profile = self.device_profile.clone();
         let profile_path = self.device_profile_path.clone();
-        Ok(tokio::spawn(async move {
-            log::debug!("Starting dbus interface: {path}");
-            let iface = CompositeDeviceInterface::new(client, profile, profile_path);
-            if let Err(e) = conn.object_server().at(path.clone(), iface).await {
-                log::debug!("Failed to start dbus interface {path}: {e:?}");
-            } else {
-                log::debug!("Started listening on dbus interface: {path}");
-            }
-        }))
+        let iface = CompositeDeviceInterface::new(client, profile, profile_path);
+        self.dbus.register(iface);
+
+        Ok(())
     }
 
     /// Starts the [CompositeDevice] and listens for events from all source
     /// devices to translate the events and send them to the appropriate target.
     pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         log::debug!("Starting composite device");
-
-        let dbus_path = self.dbus_path.clone();
 
         // Start all source devices
         self.run_source_devices().await?;
@@ -320,6 +308,11 @@ impl CompositeDevice {
                     CompositeCommand::GetCapabilities(sender) => {
                         if let Err(e) = sender.send(self.capabilities.clone()).await {
                             log::error!("Failed to send capabilities: {:?}", e);
+                        }
+                    }
+                    CompositeCommand::GetOutputCapabilities(sender) => {
+                        if let Err(e) = sender.send(self.output_capabilities.clone()).await {
+                            log::debug!("Failed to send output capabilities: {:?}", e);
                         }
                     }
                     CompositeCommand::GetTargetCapabilities(sender) => {
@@ -368,13 +361,13 @@ impl CompositeDevice {
                         }
                     }
                     CompositeCommand::SourceDeviceStopped(device) => {
-                        log::debug!("Detected source device stopped: {}", device.devnode());
+                        log::debug!("Detected source device stopped: {}", device.path());
                         if let Err(e) = self.on_source_device_removed(device).await {
                             log::error!("Failed to remove source device: {:?}", e);
                         }
                     }
                     CompositeCommand::SourceDeviceRemoved(device) => {
-                        log::debug!("Detected source device removed: {}", device.devnode());
+                        log::debug!("Detected source device removed: {}", device.path());
                         devices_removed = true;
                         if let Err(e) = self.on_source_device_removed(device).await {
                             log::error!("Failed to remove source device: {:?}", e);
@@ -422,8 +415,8 @@ impl CompositeDevice {
                             Err(e) => Err(e.to_string()),
                         };
                         CompositeDeviceInterface::update_profile(
-                            &self.conn,
-                            &self.dbus_path,
+                            self.dbus.connection(),
+                            self.dbus.path(),
                             Some(profile),
                             None,
                         );
@@ -449,8 +442,8 @@ impl CompositeDevice {
                             Err(e) => Err(e.to_string()),
                         };
                         CompositeDeviceInterface::update_profile(
-                            &self.conn,
-                            &self.dbus_path,
+                            self.dbus.connection(),
+                            self.dbus.path(),
                             Some(profile),
                             Some(path),
                         );
@@ -492,18 +485,27 @@ impl CompositeDevice {
                         self.set_intercept_activation(activation_caps, target_cap)
                     }
                     CompositeCommand::Stop => {
-                        log::debug!("Got STOP signal. Stopping CompositeDevice: {dbus_path}");
+                        log::debug!(
+                            "Got STOP signal. Stopping CompositeDevice: {}",
+                            self.dbus.path()
+                        );
                         break 'main;
                     }
                     CompositeCommand::Suspend(sender) => {
-                        log::info!("Preparing to suspend target devices for: {dbus_path}");
+                        log::info!(
+                            "Preparing to suspend target devices for: {}",
+                            self.dbus.path()
+                        );
                         self.targets.handle_suspend().await;
                         if let Err(e) = sender.send(()).await {
                             log::error!("Failed to send suspend response: {e:?}");
                         }
                     }
                     CompositeCommand::Resume(sender) => {
-                        log::info!("Preparing to resume target devices for: {dbus_path}");
+                        log::info!(
+                            "Preparing to resume target devices for: {}",
+                            self.dbus.path()
+                        );
                         self.targets.handle_resume().await;
                         if let Err(e) = sender.send(()).await {
                             log::error!("Failed to send resume response: {e:?}");
@@ -523,15 +525,18 @@ impl CompositeDevice {
             // the device unless configured to persist.
             if devices_removed && self.source_devices_used.is_empty() {
                 if persist {
-                    log::debug!("No source devices remain, but CompositeDevice {dbus_path} has persist enabled. Clearing target devices states.");
+                    log::debug!("No source devices remain, but CompositeDevice {} has persist enabled. Clearing target devices states.", self.dbus.path());
                     self.targets.clear_state().await;
                 } else {
-                    log::debug!("No source devices remain. Stopping CompositeDevice {dbus_path}");
+                    log::debug!(
+                        "No source devices remain. Stopping CompositeDevice {}",
+                        self.dbus.path()
+                    );
                     break 'main;
                 }
             }
         }
-        log::info!("CompositeDevice stopping: {dbus_path}");
+        log::info!("CompositeDevice stopping: {}", self.dbus.path());
 
         // Stop all target devices
         log::debug!("Stopping target devices");
@@ -563,7 +568,7 @@ impl CompositeDevice {
             res?;
         }
 
-        log::info!("CompositeDevice stopped: {dbus_path}");
+        log::info!("CompositeDevice stopped: {}", self.dbus.path());
 
         Ok(())
     }
@@ -607,6 +612,7 @@ impl CompositeDevice {
         let sources = self.source_devices_discovered.drain(..);
         for source_device in sources {
             let device_id = source_device.get_id();
+            log::debug!("Starting source device: {device_id}");
             // If the source device is blocked, don't bother running it
             if self.source_devices_blocked.contains(&device_id) {
                 log::debug!("Source device '{device_id}' blocked. Skipping running.");
@@ -616,13 +622,7 @@ impl CompositeDevice {
             let source_tx = source_device.client();
             self.source_devices.insert(device_id.clone(), source_tx);
             let tx = self.tx.clone();
-
-            // Add the IIO IMU Dbus interface. We do this here because it needs the source
-            // device transmitter and this is the only place we can refrence it at the moment.
-            let device = source_device.get_device_ref().clone();
-            if let SourceDevice::Iio(_) = source_device {
-                SourceIioImuInterface::listen_on_dbus(self.conn.clone(), device.clone()).await?;
-            }
+            let device = source_device.get_device_ref().to_owned();
 
             self.source_device_tasks.spawn(async move {
                 if let Err(e) = source_device.run().await {
@@ -652,9 +652,21 @@ impl CompositeDevice {
         log::trace!("Received event: {:?} from {device_id}", raw_event);
 
         // Convert the event into a NativeEvent
-        let Event::Native(event) = raw_event;
+        let Event::Native(mut event) = raw_event;
         let cap = event.as_capability();
         log::trace!("Event capability: {:?}", cap);
+
+        if let Some(context) = event.get_context_mut() {
+            context
+                .metrics_mut()
+                .get_mut("source_send")
+                .unwrap()
+                .finish();
+            context
+                .metrics_mut()
+                .create_child_span("root", "composite_device")
+                .start();
+        }
 
         // Only send valid events to the target device(s)
         if cap == Capability::NotImplemented {
@@ -1458,7 +1470,7 @@ impl CompositeDevice {
     }
 
     /// Executed whenever a source device is added to this [CompositeDevice].
-    async fn on_source_device_added(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
+    async fn on_source_device_added(&mut self, device: DeviceInfo) -> Result<(), Box<dyn Error>> {
         if let Err(e) = self.add_source_device(device) {
             return Err(e.to_string().into());
         }
@@ -1475,8 +1487,8 @@ impl CompositeDevice {
     }
 
     /// Executed whenever a source device is removed from this [CompositeDevice]
-    async fn on_source_device_removed(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
-        let path = device.devnode();
+    async fn on_source_device_removed(&mut self, device: DeviceInfo) -> Result<(), Box<dyn Error>> {
+        let path = device.path();
         let id = device.get_id();
 
         // Remove any ffb effects this device registered
@@ -1513,6 +1525,10 @@ impl CompositeDevice {
         // Signal to DBus that source devices have changed
         self.signal_sources_changed().await;
 
+        // Clear the state of target devices in case the source device was
+        // disconnected in the middle of an input.
+        self.targets.schedule_clear_state();
+
         log::debug!(
             "Current source device paths: {:?}",
             self.source_device_paths
@@ -1528,7 +1544,7 @@ impl CompositeDevice {
     /// Creates and adds a source device using the given [SourceDeviceInfo]
     fn add_source_device(
         &mut self,
-        device: UdevDevice,
+        device: DeviceInfo,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Check to see if this source device should be blocked.
         let mut is_blocked = false;
@@ -1540,49 +1556,56 @@ impl CompositeDevice {
             }
         }
 
-        let subsystem = device.subsystem();
+        log::debug!("Adding source device: {:?}", device.name());
+        let source_device = match device {
+            DeviceInfo::Udev(device) => {
+                let subsystem = device.subsystem();
 
-        // Hide the device if specified
-        let should_passthru = source_config
-            .as_ref()
-            .and_then(|c| c.passthrough)
-            .unwrap_or(false);
-        let should_hide = !should_passthru && subsystem.as_str() != "iio";
-        if should_hide {
-            let source_path = device.devnode();
-            self.source_devices_to_hide.push(source_path);
-        }
-
-        let source_device = match subsystem.as_str() {
-            "input" => {
-                log::debug!("Adding EVDEV source device: {:?}", device.name());
-                if is_blocked {
-                    is_blocked_evdev = true;
+                // Hide the device if specified
+                let should_passthru = source_config
+                    .as_ref()
+                    .and_then(|c| c.passthrough)
+                    .unwrap_or(false);
+                let should_hide = !should_passthru && subsystem.as_str() != "iio";
+                if should_hide {
+                    let source_path = device.devnode();
+                    self.source_devices_to_hide.push(source_path);
                 }
-                let device = EventDevice::new(device, self.client(), source_config.clone())?;
-                SourceDevice::Event(device)
-            }
-            "hidraw" => {
-                log::debug!("Adding HIDRAW source device: {:?}", device.name());
-                let device = HidRawDevice::new(device, self.client(), source_config.clone())?;
-                SourceDevice::HidRaw(device)
-            }
-            "iio" => {
-                log::debug!("Adding IIO source device: {:?}", device.name());
-                let device = IioDevice::new(device, self.client(), source_config.clone())?;
-                SourceDevice::Iio(device)
-            }
-            "leds" => {
-                log::debug!("Adding LED source device: {:?}", device.sysname());
-                let device = LedDevice::new(device, self.client(), source_config.clone())?;
-                SourceDevice::Led(device)
-            }
-            _ => {
-                return Err(format!(
-                    "Unspported subsystem: {subsystem}, unable to add source device {}",
-                    device.name()
-                )
-                .into())
+
+                match subsystem.as_str() {
+                    "input" => {
+                        log::debug!("Adding EVDEV source device: {:?}", device.name());
+                        if is_blocked {
+                            is_blocked_evdev = true;
+                        }
+                        let device =
+                            EventDevice::new(device, self.client(), source_config.clone())?;
+                        SourceDevice::Event(device)
+                    }
+                    "hidraw" => {
+                        log::debug!("Adding HIDRAW source device: {:?}", device.name());
+                        let device =
+                            HidRawDevice::new(device, self.client(), source_config.clone())?;
+                        SourceDevice::HidRaw(device)
+                    }
+                    "iio" => {
+                        log::debug!("Adding IIO source device: {:?}", device.name());
+                        let device = IioDevice::new(device, self.client(), source_config.clone())?;
+                        SourceDevice::Iio(device)
+                    }
+                    "leds" => {
+                        log::debug!("Adding LED source device: {:?}", device.sysname());
+                        let device = LedDevice::new(device, self.client(), source_config.clone())?;
+                        SourceDevice::Led(device)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Unspported subsystem: {subsystem}, unable to add source device {}",
+                            device.name()
+                        )
+                        .into())
+                    }
+                }
             }
         };
 
@@ -1597,13 +1620,18 @@ impl CompositeDevice {
                 }
                 self.capabilities.insert(cap);
             }
+
+            let output_capabilities = source_device.get_output_capabilities()?;
+            for cap in output_capabilities {
+                self.output_capabilities.insert(cap);
+            }
         }
 
         // Check if this device should be blocked from sending events to target devices.
         let id = source_device.get_id();
         if let Some(device_config) = self
             .config
-            .get_matching_device(source_device.get_device_ref())
+            .get_matching_device(&source_device.get_device_ref().to_owned())
         {
             if let Some(blocked) = device_config.blocked {
                 // Blocked event devices should still be run so they can be
@@ -1675,6 +1703,18 @@ impl CompositeDevice {
 
         // Set the target devices to use if it is defined in the profile
         if let Some(target_devices) = profile.target_devices.clone() {
+            let target_devices = target_devices
+                .iter()
+                .filter_map(|kind| {
+                    let res = TargetDeviceTypeId::try_from(kind.as_str());
+                    if res.is_err() {
+                        log::warn!("Skipping unsupported target device in profile: {kind}");
+                        None
+                    } else {
+                        res.ok()
+                    }
+                })
+                .collect();
             let tx = self.tx.clone();
             tokio::task::spawn(async move {
                 if let Err(e) = tx
@@ -1888,15 +1928,15 @@ impl CompositeDevice {
 
     /// Emit a DBus signal when source devices change
     async fn signal_sources_changed(&self) {
-        let dbus_path = self.dbus_path.clone();
-        let conn = self.conn.clone();
+        let dbus_path = self.dbus.path().to_string();
+        let conn = self.dbus.connection().clone();
 
         tokio::task::spawn(async move {
             // Get the object instance at the given path so we can send DBus signal
             // updates
             let iface_ref = match conn
                 .object_server()
-                .interface::<_, CompositeDeviceInterface>(dbus_path.clone())
+                .interface::<_, CompositeDeviceInterface>(dbus_path)
                 .await
             {
                 Ok(iface) => iface,

@@ -3,9 +3,7 @@ pub mod dualsense;
 pub mod flydigi_vader_4_pro;
 pub mod fts3528;
 pub mod horipad_steam;
-pub mod lego_dinput_combined;
-pub mod lego_dinput_split;
-pub mod lego_fps_mode;
+pub mod lego_touchpad;
 pub mod lego_xinput;
 pub mod legos_config;
 pub mod legos_imu;
@@ -32,18 +30,24 @@ use xpad_uhid::XpadUhid;
 use zotac_zone::ZotacZone;
 
 use crate::{
-    config, constants::BUS_SOURCES_PREFIX, drivers,
-    input::composite_device::client::CompositeDeviceClient, udev::device::UdevDevice,
+    config,
+    constants::BUS_SOURCES_PREFIX,
+    drivers,
+    input::{
+        capability::Capability, composite_device::client::CompositeDeviceClient,
+        info::DeviceInfoRef, output_capability::OutputCapability,
+        source::hidraw::lego_touchpad::LegionTouchpadController,
+    },
+    udev::device::UdevDevice,
 };
 
 use self::{
     dualsense::DualSenseController, fts3528::Fts3528Touchscreen,
-    lego_dinput_combined::LegionControllerDCombined, lego_dinput_split::LegionControllerDSplit,
-    lego_fps_mode::LegionControllerFPS, lego_xinput::LegionControllerX,
-    legos_xinput::LegionSXInputController, opineo::OrangePiNeoTouchpad, steam_deck::DeckController,
+    lego_xinput::LegionXInputController, legos_xinput::LegionSXInputController,
+    opineo::OrangePiNeoTouchpad, steam_deck::DeckController,
 };
 
-use super::{SourceDeviceCompatible, SourceDriver, SourceDriverOptions};
+use super::{InputError, OutputError, SourceDeviceCompatible, SourceDriver, SourceDriverOptions};
 
 /// List of available drivers
 enum DriverType {
@@ -51,9 +55,7 @@ enum DriverType {
     DualSense,
     Fts3528Touchscreen,
     HoripadSteam,
-    LegionGoDCombined,
-    LegionGoDSplit,
-    LegionGoFPS,
+    LegionGoTouchpad,
     LegionGoSConfig,
     LegionGoSImu,
     LegionGoSTouchpad,
@@ -76,14 +78,12 @@ pub enum HidRawDevice {
     DualSense(SourceDriver<DualSenseController>),
     Fts3528Touchscreen(SourceDriver<Fts3528Touchscreen>),
     HoripadSteam(SourceDriver<HoripadSteam>),
-    LegionGoDCombined(SourceDriver<LegionControllerDCombined>),
-    LegionGoDSplit(SourceDriver<LegionControllerDSplit>),
-    LegionGoFPS(SourceDriver<LegionControllerFPS>),
+    LegionGoTouchpad(SourceDriver<LegionTouchpadController>),
     LegionGoSConfig(SourceDriver<LegionSConfigController>),
     LegionGoSImu(SourceDriver<LegionSImuController>),
     LegionGoSTouchpad(SourceDriver<LegionSTouchpadController>),
     LegionGoSXInput(SourceDriver<LegionSXInputController>),
-    LegionGoXInput(SourceDriver<LegionControllerX>),
+    LegionGoXInput(SourceDriver<LegionXInputController>),
     MsiClaw(SourceDriver<MsiClaw>),
     OrangePiNeo(SourceDriver<OrangePiNeoTouchpad>),
     RogAlly(SourceDriver<RogAlly>),
@@ -94,15 +94,13 @@ pub enum HidRawDevice {
 }
 
 impl SourceDeviceCompatible for HidRawDevice {
-    fn get_device_ref(&self) -> &UdevDevice {
+    fn get_device_ref(&self) -> DeviceInfoRef {
         match self {
             HidRawDevice::Blocked(source_driver) => source_driver.info_ref(),
             HidRawDevice::DualSense(source_driver) => source_driver.info_ref(),
             HidRawDevice::Fts3528Touchscreen(source_driver) => source_driver.info_ref(),
             HidRawDevice::HoripadSteam(source_driver) => source_driver.info_ref(),
-            HidRawDevice::LegionGoDCombined(source_driver) => source_driver.info_ref(),
-            HidRawDevice::LegionGoDSplit(source_driver) => source_driver.info_ref(),
-            HidRawDevice::LegionGoFPS(source_driver) => source_driver.info_ref(),
+            HidRawDevice::LegionGoTouchpad(source_driver) => source_driver.info_ref(),
             HidRawDevice::LegionGoSConfig(source_driver) => source_driver.info_ref(),
             HidRawDevice::LegionGoSImu(source_driver) => source_driver.info_ref(),
             HidRawDevice::LegionGoSTouchpad(source_driver) => source_driver.info_ref(),
@@ -124,9 +122,7 @@ impl SourceDeviceCompatible for HidRawDevice {
             HidRawDevice::DualSense(source_driver) => source_driver.get_id(),
             HidRawDevice::Fts3528Touchscreen(source_driver) => source_driver.get_id(),
             HidRawDevice::HoripadSteam(source_driver) => source_driver.get_id(),
-            HidRawDevice::LegionGoDCombined(source_driver) => source_driver.get_id(),
-            HidRawDevice::LegionGoDSplit(source_driver) => source_driver.get_id(),
-            HidRawDevice::LegionGoFPS(source_driver) => source_driver.get_id(),
+            HidRawDevice::LegionGoTouchpad(source_driver) => source_driver.get_id(),
             HidRawDevice::LegionGoSConfig(source_driver) => source_driver.get_id(),
             HidRawDevice::LegionGoSImu(source_driver) => source_driver.get_id(),
             HidRawDevice::LegionGoSTouchpad(source_driver) => source_driver.get_id(),
@@ -148,9 +144,7 @@ impl SourceDeviceCompatible for HidRawDevice {
             HidRawDevice::DualSense(source_driver) => source_driver.client(),
             HidRawDevice::Fts3528Touchscreen(source_driver) => source_driver.client(),
             HidRawDevice::HoripadSteam(source_driver) => source_driver.client(),
-            HidRawDevice::LegionGoDCombined(source_driver) => source_driver.client(),
-            HidRawDevice::LegionGoDSplit(source_driver) => source_driver.client(),
-            HidRawDevice::LegionGoFPS(source_driver) => source_driver.client(),
+            HidRawDevice::LegionGoTouchpad(source_driver) => source_driver.client(),
             HidRawDevice::LegionGoSConfig(source_driver) => source_driver.client(),
             HidRawDevice::LegionGoSImu(source_driver) => source_driver.client(),
             HidRawDevice::LegionGoSTouchpad(source_driver) => source_driver.client(),
@@ -172,9 +166,7 @@ impl SourceDeviceCompatible for HidRawDevice {
             HidRawDevice::DualSense(source_driver) => source_driver.run().await,
             HidRawDevice::Fts3528Touchscreen(source_driver) => source_driver.run().await,
             HidRawDevice::HoripadSteam(source_driver) => source_driver.run().await,
-            HidRawDevice::LegionGoDCombined(source_driver) => source_driver.run().await,
-            HidRawDevice::LegionGoDSplit(source_driver) => source_driver.run().await,
-            HidRawDevice::LegionGoFPS(source_driver) => source_driver.run().await,
+            HidRawDevice::LegionGoTouchpad(source_driver) => source_driver.run().await,
             HidRawDevice::LegionGoSConfig(source_driver) => source_driver.run().await,
             HidRawDevice::LegionGoSImu(source_driver) => source_driver.run().await,
             HidRawDevice::LegionGoSTouchpad(source_driver) => source_driver.run().await,
@@ -190,17 +182,13 @@ impl SourceDeviceCompatible for HidRawDevice {
         }
     }
 
-    fn get_capabilities(
-        &self,
-    ) -> Result<Vec<crate::input::capability::Capability>, super::InputError> {
+    fn get_capabilities(&self) -> Result<Vec<Capability>, InputError> {
         match self {
             HidRawDevice::Blocked(source_driver) => source_driver.get_capabilities(),
             HidRawDevice::DualSense(source_driver) => source_driver.get_capabilities(),
             HidRawDevice::Fts3528Touchscreen(source_driver) => source_driver.get_capabilities(),
             HidRawDevice::HoripadSteam(source_driver) => source_driver.get_capabilities(),
-            HidRawDevice::LegionGoDCombined(source_driver) => source_driver.get_capabilities(),
-            HidRawDevice::LegionGoDSplit(source_driver) => source_driver.get_capabilities(),
-            HidRawDevice::LegionGoFPS(source_driver) => source_driver.get_capabilities(),
+            HidRawDevice::LegionGoTouchpad(source_driver) => source_driver.get_capabilities(),
             HidRawDevice::LegionGoSConfig(source_driver) => source_driver.get_capabilities(),
             HidRawDevice::LegionGoSImu(source_driver) => source_driver.get_capabilities(),
             HidRawDevice::LegionGoSTouchpad(source_driver) => source_driver.get_capabilities(),
@@ -216,15 +204,41 @@ impl SourceDeviceCompatible for HidRawDevice {
         }
     }
 
+    fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError> {
+        match self {
+            HidRawDevice::Blocked(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::DualSense(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::Fts3528Touchscreen(source_driver) => {
+                source_driver.get_output_capabilities()
+            }
+            HidRawDevice::HoripadSteam(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::LegionGoTouchpad(source_driver) => {
+                source_driver.get_output_capabilities()
+            }
+            HidRawDevice::LegionGoSConfig(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::LegionGoSImu(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::LegionGoSTouchpad(source_driver) => {
+                source_driver.get_output_capabilities()
+            }
+            HidRawDevice::LegionGoSXInput(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::LegionGoXInput(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::MsiClaw(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::OrangePiNeo(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::RogAlly(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::SteamDeck(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::Vader4Pro(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::XpadUhid(source_driver) => source_driver.get_output_capabilities(),
+            HidRawDevice::ZotacZone(source_driver) => source_driver.get_output_capabilities(),
+        }
+    }
+
     fn get_device_path(&self) -> String {
         match self {
             HidRawDevice::Blocked(source_driver) => source_driver.get_device_path(),
             HidRawDevice::DualSense(source_driver) => source_driver.get_device_path(),
             HidRawDevice::Fts3528Touchscreen(source_driver) => source_driver.get_device_path(),
             HidRawDevice::HoripadSteam(source_driver) => source_driver.get_device_path(),
-            HidRawDevice::LegionGoDCombined(source_driver) => source_driver.get_device_path(),
-            HidRawDevice::LegionGoDSplit(source_driver) => source_driver.get_device_path(),
-            HidRawDevice::LegionGoFPS(source_driver) => source_driver.get_device_path(),
+            HidRawDevice::LegionGoTouchpad(source_driver) => source_driver.get_device_path(),
             HidRawDevice::LegionGoSConfig(source_driver) => source_driver.get_device_path(),
             HidRawDevice::LegionGoSImu(source_driver) => source_driver.get_device_path(),
             HidRawDevice::LegionGoSTouchpad(source_driver) => source_driver.get_device_path(),
@@ -264,7 +278,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -279,7 +293,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -294,30 +308,22 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
                 Ok(Self::SteamDeck(source_device))
             }
-            DriverType::LegionGoDCombined => {
-                let device = LegionControllerDCombined::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
-                Ok(Self::LegionGoDCombined(source_device))
-            }
-            DriverType::LegionGoDSplit => {
-                let device = LegionControllerDSplit::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
-                Ok(Self::LegionGoDSplit(source_device))
-            }
-            DriverType::LegionGoFPS => {
-                let device = LegionControllerFPS::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
-                Ok(Self::LegionGoFPS(source_device))
+            DriverType::LegionGoTouchpad => {
+                let device = LegionTouchpadController::new(device_info.clone())?;
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
+                Ok(Self::LegionGoTouchpad(source_device))
             }
             DriverType::LegionGoXInput => {
-                let device = LegionControllerX::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let device = LegionXInputController::new(device_info.clone())?;
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::LegionGoXInput(source_device))
             }
             DriverType::LegionGoSConfig => {
@@ -329,7 +335,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -344,7 +350,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -359,7 +365,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -374,7 +380,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -382,22 +388,26 @@ impl HidRawDevice {
             }
             DriverType::OrangePiNeo => {
                 let device = OrangePiNeoTouchpad::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::OrangePiNeo(source_device))
             }
             DriverType::MsiClaw => {
                 let device = MsiClaw::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::MsiClaw(source_device))
             }
             DriverType::Fts3528Touchscreen => {
                 let device = Fts3528Touchscreen::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::Fts3528Touchscreen(source_device))
             }
             DriverType::XpadUhid => {
                 let device = XpadUhid::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::XpadUhid(source_device))
             }
             DriverType::RogAlly => {
@@ -409,7 +419,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -417,7 +427,8 @@ impl HidRawDevice {
             }
             DriverType::HoripadSteam => {
                 let device = HoripadSteam::new(device_info.clone())?;
-                let source_device = SourceDriver::new(composite_device, device, device_info, conf);
+                let source_device =
+                    SourceDriver::new(composite_device, device, device_info.into(), conf);
                 Ok(Self::HoripadSteam(source_device))
             }
             DriverType::Vader4Pro => {
@@ -429,7 +440,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -444,7 +455,7 @@ impl HidRawDevice {
                 let source_device = SourceDriver::new_with_options(
                     composite_device,
                     device,
-                    device_info,
+                    device_info.into(),
                     options,
                     conf,
                 );
@@ -475,32 +486,21 @@ impl HidRawDevice {
             return DriverType::SteamDeck;
         }
 
-        // Legion Go Dinput Combined
-        if vid == drivers::lego::driver_dinput_combined::VID
-            && pid == drivers::lego::driver_dinput_combined::PID
+        // Legion Go Touchpad
+        if vid == drivers::lego::VID
+            && drivers::lego::PIDS.contains(&pid)
+            && iid == drivers::lego::TP_IID
         {
-            log::info!("Detected Legion Go DInput Combined Mode");
-            return DriverType::LegionGoDCombined;
-        }
-
-        // Legion Go Dinput Split
-        if vid == drivers::lego::driver_dinput_split::VID
-            && pid == drivers::lego::driver_dinput_split::PID
-        {
-            log::info!("Detected Legion Go DInput Split Mode");
-            return DriverType::LegionGoDSplit;
-        }
-
-        // Legion Go FPS Mode
-        if vid == drivers::lego::driver_fps_mode::VID && pid == drivers::lego::driver_fps_mode::PID
-        {
-            log::info!("Detected Legion Go FPS Mode");
-            return DriverType::LegionGoFPS;
+            log::info!("Detected Legion Go Touchpad");
+            return DriverType::LegionGoTouchpad;
         }
 
         // Legion Go XInput
-        if vid == drivers::lego::driver_xinput::VID && pid == drivers::lego::driver_xinput::PID {
-            log::info!("Detected Legion Go XInput Mode");
+        if vid == drivers::lego::VID
+            && drivers::lego::PIDS.contains(&pid)
+            && iid == drivers::lego::GP_IID
+        {
+            log::info!("Detected Legion Go Controller");
             return DriverType::LegionGoXInput;
         }
 
@@ -608,5 +608,5 @@ impl HidRawDevice {
 
 /// Returns the DBus path for a [HIDRawDevice] from a device path (E.g. /dev/hidraw0)
 pub fn get_dbus_path(device_name: String) -> String {
-    format!("{}/{}", BUS_SOURCES_PREFIX, device_name)
+    format!("{BUS_SOURCES_PREFIX}/{device_name}")
 }

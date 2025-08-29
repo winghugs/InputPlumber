@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    env,
     error::Error,
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
@@ -12,7 +13,7 @@ use led::LedDevice;
 use thiserror::Error;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
-use crate::{config, udev::device::UdevDevice};
+use crate::config;
 
 use self::{
     client::SourceDeviceClient, command::SourceCommand, evdev::EventDevice, hidraw::HidRawDevice,
@@ -22,7 +23,9 @@ use self::{
 use super::{
     capability::Capability,
     composite_device::client::CompositeDeviceClient,
-    event::{native::NativeEvent, Event},
+    event::{context::EventContext, native::NativeEvent, Event},
+    info::{DeviceInfo, DeviceInfoRef},
+    output_capability::OutputCapability,
     output_event::OutputEvent,
 };
 
@@ -72,6 +75,7 @@ impl From<Box<dyn Error + Send + Sync>> for InputError {
 /// Possible errors for a source device client
 #[derive(Error, Debug)]
 pub enum OutputError {
+    #[allow(dead_code)]
     #[error("Output behavior is not implemented")]
     NotImplemented,
     #[error("OutputError occurred running source device: {0}")]
@@ -122,6 +126,12 @@ pub trait SourceOutputDevice {
         //log::trace!("Received output event: {event:?}");
         let _ = event;
         Ok(())
+    }
+
+    /// Returns the possible output events this device is capable of (e.g. force feedback, LED,
+    /// etc.)
+    fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError> {
+        Ok(vec![])
     }
 
     /// Upload the given force feedback effect data to the source device. Returns
@@ -178,7 +188,7 @@ pub struct SourceDriver<T: SourceInputDevice + SourceOutputDevice> {
     event_include_list: HashSet<Capability>,
     event_exclude_list: HashSet<Capability>,
     implementation: Arc<Mutex<T>>,
-    device_info: UdevDevice,
+    device_info: DeviceInfo,
     composite_device: CompositeDeviceClient,
     tx: mpsc::Sender<SourceCommand>,
     rx: mpsc::Receiver<SourceCommand>,
@@ -189,7 +199,7 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
     pub fn new(
         composite_device: CompositeDeviceClient,
         device: T,
-        device_info: UdevDevice,
+        device_info: DeviceInfo,
         config: Option<config::SourceDevice>,
     ) -> Self {
         let options = SourceDriverOptions::default();
@@ -200,7 +210,7 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
     pub fn new_with_options(
         composite_device: CompositeDeviceClient,
         device: T,
-        device_info: UdevDevice,
+        device_info: DeviceInfo,
         options: SourceDriverOptions,
         config: Option<config::SourceDevice>,
     ) -> Self {
@@ -233,7 +243,7 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
         }
         let event_filter_enabled = !events_exclude.is_empty() || !events_include.is_empty();
         if event_filter_enabled {
-            let devnode = device_info.devnode();
+            let devnode = device_info.path();
             if !events_include.is_empty() {
                 log::debug!("Source device '{devnode}' filter includes events: {events_include:?}");
             }
@@ -311,9 +321,18 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
         Ok(caps)
     }
 
+    /// Returns the possible output events this device is capable of. (e.g. force feedback, LEDs,
+    /// etc.)
+    pub fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError> {
+        self.implementation
+            .lock()
+            .unwrap()
+            .get_output_capabilities()
+    }
+
     /// Returns the path to the device (e.g. "/dev/input/event0")
     pub fn get_device_path(&self) -> String {
-        self.device_info.devnode()
+        self.device_info.path()
     }
 
     /// Returns a transmitter channel that can be used to send events to this device
@@ -322,13 +341,19 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
     }
 
     /// Returns udev device information about the device as a reference
-    pub fn info_ref(&self) -> &UdevDevice {
-        &self.device_info
+    pub fn info_ref(&self) -> DeviceInfoRef {
+        match &self.device_info {
+            DeviceInfo::Udev(device) => device.into(),
+        }
     }
 
     /// Run the source device, consuming the device.
     pub async fn run(self) -> Result<(), Box<dyn Error>> {
         let device_id = self.get_id();
+        let metrics_enabled = match env::var("ENABLE_METRICS") {
+            Ok(value) => value.as_str() == "1",
+            Err(_) => false,
+        };
 
         // Spawn a blocking task to run the source device.
         let task =
@@ -336,9 +361,32 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
                 let mut rx = self.rx;
                 let mut implementation = self.implementation.lock().unwrap();
                 loop {
+                    // Create a context with performance metrics for each event
+                    let mut context = if metrics_enabled {
+                        Some(EventContext::new())
+                    } else {
+                        None
+                    };
+                    if let Some(ref mut context) = context {
+                        let root_span = context.metrics_mut().create_span("root");
+                        root_span.start();
+                    }
+
                     // Poll the implementation for events
+                    if let Some(ref mut context) = context {
+                        let poll_span = context
+                            .metrics_mut()
+                            .create_child_span("root", "source_poll");
+                        poll_span.start();
+                    }
                     let events = implementation.poll()?;
-                    for event in events.into_iter() {
+                    if let Some(ref mut context) = context {
+                        let poll_span = context.metrics_mut().get_mut("source_poll").unwrap();
+                        poll_span.finish();
+                    }
+
+                    // Process each event
+                    for mut event in events.into_iter() {
                         if self.event_filter_enabled
                             && Self::should_filter(
                                 &self.event_exclude_list,
@@ -347,6 +395,14 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
                             )
                         {
                             continue;
+                        }
+                        if let Some(ref context) = context {
+                            let mut context = context.clone();
+                            let send_span = context
+                                .metrics_mut()
+                                .create_child_span("root", "source_send");
+                            send_span.start();
+                            event.set_context(context);
                         }
                         let event = Event::Native(event);
                         let result = self
@@ -445,7 +501,7 @@ impl<T: SourceInputDevice + SourceOutputDevice + Send + 'static> SourceDriver<T>
 
 pub(crate) trait SourceDeviceCompatible {
     /// Returns a copy of the UdevDevice
-    fn get_device_ref(&self) -> &UdevDevice;
+    fn get_device_ref(&self) -> DeviceInfoRef;
 
     /// Returns a unique identifier for the source device.
     fn get_id(&self) -> String;
@@ -458,6 +514,9 @@ pub(crate) trait SourceDeviceCompatible {
 
     /// Returns the capabilities that this source device can fulfill.
     fn get_capabilities(&self) -> Result<Vec<Capability>, InputError>;
+
+    /// Returns the output capabilities that this source device can fulfill.
+    fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError>;
 
     /// Returns the full path to the device handler (e.g. /dev/input/event3, /dev/hidraw0)
     fn get_device_path(&self) -> String;
@@ -473,8 +532,8 @@ pub enum SourceDevice {
 }
 
 impl SourceDevice {
-    /// Returns a copy of the UdevDevice
-    pub fn get_device_ref(&self) -> &UdevDevice {
+    /// Returns a copy of the DeviceInfo
+    pub fn get_device_ref(&self) -> DeviceInfoRef {
         match self {
             SourceDevice::Event(device) => device.get_device_ref(),
             SourceDevice::HidRaw(device) => device.get_device_ref(),
@@ -520,6 +579,16 @@ impl SourceDevice {
             SourceDevice::HidRaw(device) => device.get_capabilities(),
             SourceDevice::Iio(device) => device.get_capabilities(),
             SourceDevice::Led(device) => device.get_capabilities(),
+        }
+    }
+
+    /// Returns the output capabilities that this source device can fulfill.
+    pub fn get_output_capabilities(&self) -> Result<Vec<OutputCapability>, OutputError> {
+        match self {
+            SourceDevice::Event(device) => device.get_output_capabilities(),
+            SourceDevice::HidRaw(device) => device.get_output_capabilities(),
+            SourceDevice::Iio(device) => device.get_output_capabilities(),
+            SourceDevice::Led(device) => device.get_output_capabilities(),
         }
     }
 
